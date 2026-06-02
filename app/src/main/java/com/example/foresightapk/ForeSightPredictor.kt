@@ -21,10 +21,14 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         Interpreter(
             loadModelBuffer(MODEL_FILE),
             Interpreter.Options().apply {
-                setNumThreads(2)
+                setNumThreads(1)
+                setUseXNNPACK(false)
             }
         ).also {
-            ForeSightLog.info("TFLite interpreter initialized on CPU with ${it.inputTensorCount} inputs")
+            ForeSightLog.info(
+                "TFLite interpreter initialized on CPU with ${it.inputTensorCount} inputs; " +
+                    "XNNPACK disabled"
+            )
         }
     }
     private val interpreter: Interpreter by interpreterHolder
@@ -37,7 +41,7 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         val inputLabels = buildInputLabels(launches)
         val routing = resolveInputRouting()
         val outputClassCount = interpreter.getOutputTensor(0).shape().last()
-        val output = Array(1) { FloatArray(outputClassCount) }
+        val outputBuffer = directBuffer(outputClassCount * FLOAT_BYTES)
         val diagnostics = buildList {
             add("Recent launches read: ${recentLaunches.size}")
             add("App input shape: [1, $SEQUENCE_LENGTH], dtype=int64")
@@ -46,24 +50,27 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
             add("Output classes: $outputClassCount")
             add("Unknown/PAD ID count: ${inputAppIds.count { it == 0L }}")
             add("Mapped input IDs: ${inputAppIds.joinToString(prefix = "[", postfix = "]")}")
+            add("TFLite delegate: none; CPU single-thread")
+            add("Tensor transport: direct ByteBuffer")
         }
 
         ForeSightLog.debug(diagnostics.joinToString(separator = " | "))
 
         val inputs = arrayOfNulls<Any>(interpreter.inputTensorCount)
-        inputs[routing.appSequenceIndex] = arrayOf(inputAppIds.toLongArray())
-        inputs[routing.contextSequenceIndex] = contextInput
+        inputs[routing.appSequenceIndex] = appInputBuffer(inputAppIds)
+        inputs[routing.contextSequenceIndex] = contextInputBuffer(contextInput)
 
         if (inputs.any { it == null }) {
             error("Unsupported model input count: ${interpreter.inputTensorCount}")
         }
 
+        ForeSightLog.debug("Calling TFLite interpreter.runForMultipleInputsOutputs")
         val latencyMs = measureTimeMillis {
-            interpreter.runForMultipleInputsOutputs(inputs, mapOf(0 to output))
+            interpreter.runForMultipleInputsOutputs(inputs, mapOf(0 to outputBuffer))
         }
         ForeSightLog.info("TFLite inference completed in ${latencyMs}ms")
 
-        val probabilities = normalizeScores(output[0])
+        val probabilities = normalizeScores(outputBuffer.readFloatArray(outputClassCount))
         val topPredictions = probabilities.indices
             .sortedByDescending { probabilities[it] }
             .take(5)
@@ -109,8 +116,8 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         return labels
     }
 
-    private fun buildContextInput(launches: List<AppLaunch>): Array<Array<FloatArray>> {
-        val input = Array(1) { Array(CONTEXT_FEATURES) { FloatArray(SEQUENCE_LENGTH) } }
+    private fun buildContextInput(launches: List<AppLaunch>): FloatArray {
+        val input = FloatArray(CONTEXT_FEATURES * SEQUENCE_LENGTH)
         val offset = SEQUENCE_LENGTH - launches.size
 
         launches.forEachIndexed { index, launch ->
@@ -128,12 +135,39 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
                 min(1.0f, max(0.0f, seconds / 3600.0f))
             }
 
-            input[0][0][inputIndex] = hour
-            input[0][1][inputIndex] = day
-            input[0][2][inputIndex] = gap
+            input[featureOffset(0, inputIndex)] = hour
+            input[featureOffset(1, inputIndex)] = day
+            input[featureOffset(2, inputIndex)] = gap
         }
 
         return input
+    }
+
+    private fun featureOffset(featureIndex: Int, timeIndex: Int): Int {
+        return featureIndex * SEQUENCE_LENGTH + timeIndex
+    }
+
+    private fun appInputBuffer(inputAppIds: List<Long>): ByteBuffer {
+        return directBuffer(SEQUENCE_LENGTH * LONG_BYTES).apply {
+            inputAppIds.forEach { appId -> putLong(appId) }
+            rewind()
+        }
+    }
+
+    private fun contextInputBuffer(contextInput: FloatArray): ByteBuffer {
+        return directBuffer(CONTEXT_FEATURES * SEQUENCE_LENGTH * FLOAT_BYTES).apply {
+            contextInput.forEach { value -> putFloat(value) }
+            rewind()
+        }
+    }
+
+    private fun directBuffer(byteCount: Int): ByteBuffer {
+        return ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder())
+    }
+
+    private fun ByteBuffer.readFloatArray(size: Int): FloatArray {
+        rewind()
+        return FloatArray(size) { getFloat() }
     }
 
     private fun appIdForLaunch(launch: AppLaunch): Int {
@@ -254,6 +288,8 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         private const val VOCAB_FILE = "app_vocab.json"
         private const val SEQUENCE_LENGTH = 10
         private const val CONTEXT_FEATURES = 3
+        private const val FLOAT_BYTES = 4
+        private const val LONG_BYTES = 8
 
         private val packageAliases = mapOf(
             "com.android.chrome" to "Google Chrome",
