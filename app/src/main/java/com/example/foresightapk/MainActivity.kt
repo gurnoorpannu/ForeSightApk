@@ -1,7 +1,15 @@
 package com.example.foresightapk
 
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -35,22 +43,24 @@ import com.example.foresightapk.ui.theme.ForeSightApkTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 class MainActivity : ComponentActivity() {
     private lateinit var usageEventReader: UsageEventReader
-    private lateinit var predictor: ForeSightPredictor
     private lateinit var predictionLogger: PredictionLogger
-    private var uiState by mutableStateOf(PredictionUiState(isLoading = true))
+    private var uiState by mutableStateOf(PredictionUiState())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ForeSightLog.info("MainActivity created")
         usageEventReader = UsageEventReader(this)
-        predictor = ForeSightPredictor(this)
         predictionLogger = PredictionLogger(this)
 
         enableEdgeToEdge()
@@ -67,21 +77,49 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        ForeSightLog.debug("MainActivity resumed; refreshing prediction")
+        ForeSightLog.debug("MainActivity resumed; checking Usage Access")
         if (::usageEventReader.isInitialized) {
-            runPrediction()
+            refreshUsageAccessState()
         }
     }
 
     override fun onDestroy() {
-        ForeSightLog.debug("MainActivity destroyed; closing predictor")
-        predictor.close()
+        ForeSightLog.debug("MainActivity destroyed")
         super.onDestroy()
     }
 
     private fun openUsageSettings() {
         ForeSightLog.info("Opening Android Usage Access settings")
         startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+    }
+
+    private fun refreshUsageAccessState() {
+        val usageAccessEnabled = runCatching {
+            UsageAccess.isEnabled(this)
+        }.getOrElse { error ->
+            handleFailure(
+                stage = "Usage Access check",
+                throwable = error,
+                diagnostics = listOf("Could not read AppOps usage access state.")
+            )
+            return
+        }
+
+        uiState = uiState.copy(
+            usageAccessEnabled = usageAccessEnabled,
+            isLoading = false,
+            lastUpdatedText = timestampText(),
+            errorMessage = if (usageAccessEnabled) {
+                null
+            } else {
+                "Enable Usage Access for ForeSight to read recent app launches."
+            },
+            diagnostics = if (usageAccessEnabled) {
+                listOf("Usage Access enabled. Tap Refresh to run prediction.")
+            } else {
+                listOf("Usage Access disabled.")
+            }
+        )
     }
 
     private fun runPrediction() {
@@ -124,23 +162,31 @@ class MainActivity : ComponentActivity() {
 
         lifecycleScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.Default) {
+                val recentApps = withContext(Dispatchers.Default) {
                     ForeSightLog.debug("Reading recent launch events")
-                    val recentApps = usageEventReader.readRecentLaunches()
-                    ForeSightLog.debug("Running model prediction")
-                    val prediction = predictor.predict(recentApps)
-                    runCatching {
-                        predictionLogger.log(prediction)
-                    }.onFailure { logError ->
-                        ForeSightLog.warn("Prediction succeeded but local prediction logging failed", logError)
-                        predictionLogger.logError(
-                            stage = "Prediction event logging",
-                            throwable = logError,
-                            diagnostics = prediction.diagnostics
-                        )
-                    }
-                    prediction
+                    usageEventReader.readRecentLaunches()
                 }
+                uiState = uiState.copy(
+                    recentApps = recentApps,
+                    lastUpdatedText = timestampText(),
+                    diagnostics = uiState.diagnostics + listOf(
+                        "Recent app launches loaded: ${recentApps.size}",
+                        "Starting isolated model inference."
+                    )
+                )
+                ForeSightLog.debug("Requesting isolated inference process")
+                val prediction = runIsolatedInference(recentApps)
+                runCatching {
+                    predictionLogger.log(prediction)
+                }.onFailure { logError ->
+                    ForeSightLog.warn("Prediction succeeded but local prediction logging failed", logError)
+                    predictionLogger.logError(
+                        stage = "Prediction event logging",
+                        throwable = logError,
+                        diagnostics = prediction.diagnostics
+                    )
+                }
+                prediction
             }
 
             uiState = result.fold(
@@ -174,6 +220,89 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private suspend fun runIsolatedInference(recentApps: List<AppLaunch>): PredictionResult {
+        return withTimeout(INFERENCE_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                lateinit var connection: ServiceConnection
+                var unbound = false
+
+                fun unbindOnce() {
+                    if (!unbound) {
+                        unbound = true
+                        runCatching { unbindService(connection) }
+                    }
+                }
+
+                val replyMessenger = Messenger(
+                    Handler(Looper.getMainLooper()) { message ->
+                        when (message.what) {
+                            InferenceContract.MSG_RESULT -> {
+                                unbindOnce()
+                                continuation.resume(InferenceContract.resultFromBundle(message.data))
+                                true
+                            }
+                            InferenceContract.MSG_ERROR -> {
+                                unbindOnce()
+                                continuation.resumeWithException(
+                                    IllegalStateException(
+                                        InferenceContract.errorFromBundle(message.data)
+                                    )
+                                )
+                                true
+                            }
+                            else -> false
+                        }
+                    }
+                )
+
+                connection = object : ServiceConnection {
+                    override fun onServiceConnected(name: ComponentName, service: IBinder) {
+                        ForeSightLog.debug("Connected to isolated inference process")
+                        val request = Message.obtain(null, InferenceContract.MSG_PREDICT).apply {
+                            replyTo = replyMessenger
+                            data = InferenceContract.launchesToBundle(recentApps)
+                        }
+
+                        runCatching {
+                            Messenger(service).send(request)
+                        }.onFailure { error ->
+                            unbindOnce()
+                            continuation.resumeWithException(error)
+                        }
+                    }
+
+                    override fun onServiceDisconnected(name: ComponentName) {
+                        ForeSightLog.error("Isolated inference process disconnected")
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(
+                                IllegalStateException(
+                                    "Inference process crashed while running the TFLite model."
+                                )
+                            )
+                        }
+                    }
+                }
+
+                continuation.invokeOnCancellation {
+                    unbindOnce()
+                }
+
+                val bound = bindService(
+                    Intent(this@MainActivity, InferenceService::class.java),
+                    connection,
+                    Context.BIND_AUTO_CREATE
+                )
+
+                if (!bound) {
+                    unbindOnce()
+                    continuation.resumeWithException(
+                        IllegalStateException("Could not bind inference process.")
+                    )
+                }
+            }
+        }
+    }
+
     private fun handleFailure(stage: String, throwable: Throwable, diagnostics: List<String>) {
         ForeSightLog.error("$stage failed: ${throwable.message}", throwable)
         if (::predictionLogger.isInitialized) {
@@ -199,6 +328,10 @@ class MainActivity : ComponentActivity() {
 
     private fun timestampText(): String {
         return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+    }
+
+    companion object {
+        private const val INFERENCE_TIMEOUT_MS = 8_000L
     }
 }
 
@@ -283,7 +416,7 @@ private fun ForeSightScreen(
             item {
                 SectionCard(title = "Model Input") {
                     Text("App sequence IDs: ${state.inputAppIds.joinToString(prefix = "[", postfix = "]")}")
-                    Text("Context shape: [1, 3, 10]")
+                    Text("Context shape: [1, 10, 3]")
                 }
             }
 

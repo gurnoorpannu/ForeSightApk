@@ -10,7 +10,7 @@ https://github.com/gurnoorpannu/ForeSight-MLpipeline
 
 The Android app expects these files in `app/src/main/assets/`:
 
-- `foresight_fp32.tflite`
+- `foresight_aet.tflite`
 - `app_vocab.json`
 
 They are already included in this project from the ML pipeline export. If you replace them later, keep the same filenames.
@@ -33,12 +33,12 @@ The required manifest permission is:
 
 ## Model Inputs
 
-The deployed model is `foresight_fp32.tflite` and is run with the TensorFlow Lite `Interpreter` on CPU.
+The deployed model is `foresight_aet.tflite` and is run with the TensorFlow Lite / LiteRT `Interpreter` on CPU.
 
 Inputs:
 
 - `app_sequences`: shape `[1, 10]`, dtype `int64`
-- `context_sequences`: shape `[1, 3, 10]`, dtype `float32`
+- `context_sequences`: shape `[1, 10, 3]`, dtype `float32`
 
 Context feature channels:
 
@@ -46,12 +46,12 @@ Context feature channels:
 - `day_of_week / 6.0`
 - `time_gap_seconds / 3600.0`, clipped to `[0, 1]`
 
-Important transpose warning: the PyTorch training layout was `[1, 10, 3]`, but the exported TFLite model expects context as `[1, 3, 10]`. The Android predictor fills context by channel first, then time step.
+Important export note: the old ONNX/onnx2tf model expected context as `[1, 3, 10]` and crashed native Android runtime. The current LiteRT Torch export preserves PyTorch axis order and expects context as `[1, 10, 3]`. The Android predictor fills context by time step first, then feature index.
 
 If model input ordering changes, the Android code inspects tensor shapes and routes:
 
 - `[1, 10]` to app sequence input
-- `[1, 3, 10]` to context sequence input
+- `[1, 10, 3]` to context sequence input
 
 ## Running
 

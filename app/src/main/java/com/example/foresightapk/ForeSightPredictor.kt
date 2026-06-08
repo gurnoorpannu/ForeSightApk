@@ -40,14 +40,20 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         val contextInput = buildContextInput(launches)
         val inputLabels = buildInputLabels(launches)
         val routing = resolveInputRouting()
-        val outputClassCount = interpreter.getOutputTensor(0).shape().last()
+        val outputTensor = interpreter.getOutputTensor(0)
+        val outputShape = outputTensor.shape()
+        val outputClassCount = outputShape.last()
+        ForeSightLog.debug(
+            "Output tensor[0]: name=${outputTensor.name()}, " +
+                "shape=${outputShape.contentToString()}, dtype=${outputTensor.dataType()}"
+        )
         val outputBuffer = directBuffer(outputClassCount * FLOAT_BYTES)
         val diagnostics = buildList {
             add("Recent launches read: ${recentLaunches.size}")
             add("App input shape: [1, $SEQUENCE_LENGTH], dtype=int64")
-            add("Context input shape: [1, $CONTEXT_FEATURES, $SEQUENCE_LENGTH], dtype=float32")
+            add("Context input shape: [1, $SEQUENCE_LENGTH, $CONTEXT_FEATURES], dtype=float32")
             add("Input routing: appIndex=${routing.appSequenceIndex}, contextIndex=${routing.contextSequenceIndex}")
-            add("Output classes: $outputClassCount")
+            add("Output tensor shape: ${outputShape.contentToString()}, dtype=${outputTensor.dataType()}")
             add("Unknown/PAD ID count: ${inputAppIds.count { it == 0L }}")
             add("Mapped input IDs: ${inputAppIds.joinToString(prefix = "[", postfix = "]")}")
             add("TFLite delegate: none; CPU single-thread")
@@ -135,16 +141,16 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
                 min(1.0f, max(0.0f, seconds / 3600.0f))
             }
 
-            input[featureOffset(0, inputIndex)] = hour
-            input[featureOffset(1, inputIndex)] = day
-            input[featureOffset(2, inputIndex)] = gap
+            input[contextOffset(inputIndex, 0)] = hour
+            input[contextOffset(inputIndex, 1)] = day
+            input[contextOffset(inputIndex, 2)] = gap
         }
 
         return input
     }
 
-    private fun featureOffset(featureIndex: Int, timeIndex: Int): Int {
-        return featureIndex * SEQUENCE_LENGTH + timeIndex
+    private fun contextOffset(timeIndex: Int, featureIndex: Int): Int {
+        return timeIndex * CONTEXT_FEATURES + featureIndex
     }
 
     private fun appInputBuffer(inputAppIds: List<Long>): ByteBuffer {
@@ -202,13 +208,13 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
                 tensor.dataType() == DataType.INT64 && shape.matches(1, SEQUENCE_LENGTH) -> {
                     appIndex = index
                 }
-                tensor.dataType() == DataType.FLOAT32 && shape.matches(1, CONTEXT_FEATURES, SEQUENCE_LENGTH) -> {
+                tensor.dataType() == DataType.FLOAT32 && shape.matches(1, SEQUENCE_LENGTH, CONTEXT_FEATURES) -> {
                     contextIndex = index
                 }
                 shape.size == 2 && shape.last() == SEQUENCE_LENGTH -> {
                     appIndex = index
                 }
-                shape.size == 3 && shape[1] == CONTEXT_FEATURES && shape[2] == SEQUENCE_LENGTH -> {
+                shape.size == 3 && shape[1] == SEQUENCE_LENGTH && shape[2] == CONTEXT_FEATURES -> {
                     contextIndex = index
                 }
             }
@@ -219,7 +225,7 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
                 val tensor = interpreter.getInputTensor(index)
                 "[$index name=${tensor.name()} shape=${tensor.shape().contentToString()} dtype=${tensor.dataType()}]"
             }
-            error("Could not route model inputs. Expected [1,10] and [1,3,10]. Actual: $tensorSummary")
+            error("Could not route model inputs. Expected [1,10] and [1,10,3]. Actual: $tensorSummary")
         }
 
         return InputRouting(
@@ -284,7 +290,7 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
     )
 
     companion object {
-        private const val MODEL_FILE = "foresight_fp32.tflite"
+        private const val MODEL_FILE = "foresight_aet.tflite"
         private const val VOCAB_FILE = "app_vocab.json"
         private const val SEQUENCE_LENGTH = 10
         private const val CONTEXT_FEATURES = 3
