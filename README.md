@@ -31,6 +31,12 @@ The required manifest permission is:
 <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
 ```
 
+The debug inventory screen can also show all installed packages, including non-launchable system packages. That mode uses:
+
+```xml
+<uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+```
+
 ## Model Inputs
 
 The deployed model is `foresight_aet.tflite` and is run with the TensorFlow Lite / LiteRT `Interpreter` on CPU.
@@ -52,6 +58,41 @@ If model input ordering changes, the Android code inspects tensor shapes and rou
 
 - `[1, 10]` to app sequence input
 - `[1, 10, 3]` to context sequence input
+
+## App Inventory And Mapping
+
+ForeSight now reads installed apps through `PackageManager` and shows a local inventory in the app. The inventory has two modes:
+
+- **Launchable**: apps visible through the Android launcher intent.
+- **All Installed**: all packages visible to the app, including non-launchable and system packages.
+
+For each launchable app, the app displays:
+
+- package name
+- app label
+- whether Android reports it as a system app or user app
+- whether it is launchable
+- mapped model app ID, when known
+- mapping source and confidence
+
+Package-to-vocab mapping is resolved in this order:
+
+1. manual override stored on device
+2. known package alias
+3. exact app label match
+4. normalized app label match
+5. exact package-name match
+6. fallback to unknown/PAD ID `0` for model inference
+
+Inventory rows that do not map to a real vocab label are shown as unmapped. Prediction still falls back to ID `0` so inference can run even when recent apps are not in `app_vocab.json`.
+
+Manual overrides are saved locally with Android `SharedPreferences` under:
+
+```text
+app_mapping_overrides
+```
+
+Use the **Manual Mapping** section to bind a package name to an exact vocab label from `app_vocab.json`. This does not require root.
 
 ## Running
 
@@ -112,7 +153,8 @@ Error JSON lines include:
 
 ## Current Limitations
 
-- `app_vocab.json` is label-based, while Usage Events provide package names. The app resolves package labels and includes common package aliases, but unknown apps fall back to ID `0` because the provided vocabulary has no explicit unknown token.
+- `app_vocab.json` is label-based, while Usage Events provide package names. The app resolves package labels, common package aliases, normalized labels, and manual overrides, but unknown apps still fall back to ID `0` during inference because the provided vocabulary has no explicit unknown token.
+- Phase 2 is still no-root. It can inspect launchable installed apps and improve mapping, but it cannot freeze or unfreeze apps.
 - The model is used exactly as exported: no retraining, cloud calls, GPU delegate, int8 quantization, or fp16 conversion.
 - Predictions are only as useful as the recent Usage Events available after Usage Access is enabled.
 - The UI is intentionally simple and functional for MVP validation.

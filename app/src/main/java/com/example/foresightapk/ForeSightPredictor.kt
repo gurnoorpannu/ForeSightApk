@@ -1,7 +1,6 @@
 package com.example.foresightapk
 
 import android.content.Context
-import org.json.JSONObject
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
@@ -14,8 +13,10 @@ import kotlin.math.min
 import kotlin.system.measureTimeMillis
 
 class ForeSightPredictor(private val context: Context) : AutoCloseable {
-    private val appVocab: Map<String, Int> by lazy { loadAppVocab() }
+    private val appVocab: Map<String, Int> by lazy { AppVocab.load(context) }
     private val idToLabel: Map<Int, String> by lazy { appVocab.entries.associate { it.value to it.key } }
+    private val appMapper: AppMapper by lazy { AppMapper(appVocab) }
+    private val mappingStore: AppMappingStore by lazy { AppMappingStore(context) }
     private val interpreterHolder = lazy {
         ForeSightLog.info("Loading TFLite model asset: $MODEL_FILE")
         Interpreter(
@@ -36,9 +37,10 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
     fun predict(recentLaunches: List<AppLaunch>): PredictionResult {
         ForeSightLog.info("Starting prediction for recentLaunches=${recentLaunches.size}")
         val launches = recentLaunches.takeLast(SEQUENCE_LENGTH)
-        val inputAppIds = buildAppInput(launches)
+        val launchMappings = launches.map { mappingForLaunch(it) }
+        val inputAppIds = buildAppInput(launchMappings)
         val contextInput = buildContextInput(launches)
-        val inputLabels = buildInputLabels(launches)
+        val inputLabels = buildInputLabels(launches, launchMappings)
         val routing = resolveInputRouting()
         val outputTensor = interpreter.getOutputTensor(0)
         val outputShape = outputTensor.shape()
@@ -103,9 +105,9 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         )
     }
 
-    private fun buildAppInput(launches: List<AppLaunch>): List<Long> {
+    private fun buildAppInput(launchMappings: List<AppMappingResult>): List<Long> {
         val padded = MutableList(SEQUENCE_LENGTH) { 0L }
-        val mappedIds = launches.map { appIdForLaunch(it).toLong() }
+        val mappedIds = launchMappings.map { (it.modelAppId ?: AppMapper.UNKNOWN_APP_ID).toLong() }
         val offset = SEQUENCE_LENGTH - mappedIds.size
         mappedIds.forEachIndexed { index, appId ->
             padded[offset + index] = appId
@@ -113,11 +115,16 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         return padded
     }
 
-    private fun buildInputLabels(launches: List<AppLaunch>): List<String> {
+    private fun buildInputLabels(
+        launches: List<AppLaunch>,
+        launchMappings: List<AppMappingResult>
+    ): List<String> {
         val labels = MutableList(SEQUENCE_LENGTH) { "PAD/unknown -> 0" }
         val offset = SEQUENCE_LENGTH - launches.size
         launches.forEachIndexed { index, launch ->
-            labels[offset + index] = "${launch.appLabel} -> ${appIdForLaunch(launch)}"
+            val mapping = launchMappings[index]
+            val modelId = mapping.modelAppId ?: AppMapper.UNKNOWN_APP_ID
+            labels[offset + index] = "${launch.appLabel} -> $modelId (${mapping.source.displayName})"
         }
         return labels
     }
@@ -176,21 +183,26 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         return FloatArray(size) { getFloat() }
     }
 
-    private fun appIdForLaunch(launch: AppLaunch): Int {
-        val candidates = listOfNotNull(
-            packageAliases[launch.packageName],
-            launch.appLabel,
-            launch.packageName
+    private fun mappingForLaunch(launch: AppLaunch): AppMappingResult {
+        val mapping = appMapper.map(
+            packageName = launch.packageName,
+            appLabel = launch.appLabel,
+            overrideLabel = mappingStore.getOverrideLabel(launch.packageName),
+            fallbackToUnknown = true
         )
 
-        val mapped = candidates.firstNotNullOfOrNull { appVocab[it] }
-        if (mapped == null) {
+        if (mapping.source == MappingSource.Unknown) {
             ForeSightLog.warn(
                 "No vocab match for package=${launch.packageName}, " +
                     "label=${launch.appLabel}; falling back to ID 0"
             )
+        } else {
+            ForeSightLog.debug(
+                "Mapped launch package=${launch.packageName}, label=${launch.appLabel}, " +
+                    "modelId=${mapping.modelAppId}, source=${mapping.source.displayName}"
+            )
         }
-        return mapped ?: 0
+        return mapping
     }
 
     private fun resolveInputRouting(): InputRouting {
@@ -249,26 +261,6 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
         return FloatArray(scores.size) { index -> expScores[index] / expSum }
     }
 
-    private fun loadAppVocab(): Map<String, Int> {
-        val json = context.assets.open(VOCAB_FILE).bufferedReader().use { it.readText() }
-        val root = JSONObject(json)
-        val vocab = mutableMapOf<String, Int>()
-
-        root.keys().forEach { key ->
-            when (val value = root.get(key)) {
-                is Number -> vocab[key] = value.toInt()
-                is JSONObject -> value.keys().forEach { nestedKey ->
-                    val nestedValue = value.opt(nestedKey)
-                    if (nestedValue is Number) vocab[nestedKey] = nestedValue.toInt()
-                }
-            }
-        }
-
-        check(vocab.isNotEmpty()) { "$VOCAB_FILE did not contain an app-name to id mapping" }
-        ForeSightLog.info("Loaded app vocab entries=${vocab.size} from $VOCAB_FILE")
-        return vocab
-    }
-
     private fun loadModelBuffer(fileName: String): ByteBuffer {
         val bytes = context.assets.open(fileName).use { it.readBytes() }
         ForeSightLog.info("Loaded model asset bytes=${bytes.size}")
@@ -291,42 +283,9 @@ class ForeSightPredictor(private val context: Context) : AutoCloseable {
 
     companion object {
         private const val MODEL_FILE = "foresight_aet.tflite"
-        private const val VOCAB_FILE = "app_vocab.json"
         private const val SEQUENCE_LENGTH = 10
         private const val CONTEXT_FEATURES = 3
         private const val FLOAT_BYTES = 4
         private const val LONG_BYTES = 8
-
-        private val packageAliases = mapOf(
-            "com.android.chrome" to "Google Chrome",
-            "com.google.android.googlequicksearchbox" to "Google",
-            "com.google.android.youtube" to "YouTube",
-            "com.google.android.gm" to "Gmail",
-            "com.google.android.apps.maps" to "Maps",
-            "com.google.android.apps.photos" to "Google Photos",
-            "com.google.android.apps.docs" to "Google Drive",
-            "com.android.vending" to "Google Play Store",
-            "com.google.android.apps.messaging" to "Messages",
-            "com.android.mms" to "Messaging",
-            "com.android.contacts" to "Contacts",
-            "com.android.dialer" to "Phone",
-            "com.android.settings" to "Settings",
-            "com.whatsapp" to "WhatsApp Messenger",
-            "com.instagram.android" to "Instagram",
-            "com.facebook.katana" to "Facebook",
-            "com.facebook.orca" to "Facebook Messenger",
-            "org.telegram.messenger" to "Telegram",
-            "com.twitter.android" to "Twitter",
-            "com.snapchat.android" to "Snapchat",
-            "com.discord" to "Discord",
-            "com.spotify.music" to "Spotify Music",
-            "com.netflix.mediaclient" to "Netflix",
-            "com.reddit.frontpage" to "Reddit",
-            "com.pinterest" to "Pinterest",
-            "com.ebay.mobile" to "eBay",
-            "com.amazon.mShop.android.shopping" to "Amazon Shopping",
-            "com.paypal.android.p2pmobile" to "PayPal Mobile Cash",
-            "com.brave.browser" to "Brave Browser"
-        )
     }
 }
