@@ -90,14 +90,17 @@ data class DecisionPolicy(
     val protectThreshold: Float = DEFAULT_PROTECT_THRESHOLD,
     val recentAppProtectionWindow: Int = DEFAULT_RECENT_APP_PROTECTION_WINDOW,
     val maxAppsToFreezePerCycle: Int = DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE,
-    val dryRunEnabled: Boolean = DEFAULT_DRY_RUN_ENABLED
+    val dryRunEnabled: Boolean = DEFAULT_DRY_RUN_ENABLED,
+    val predictionIntervalSeconds: Int = DEFAULT_PREDICTION_INTERVAL_SECONDS,
+    val pauseWhenBatteryLow: Boolean = DEFAULT_PAUSE_WHEN_BATTERY_LOW
 ) {
     fun sanitized(): DecisionPolicy {
         return copy(
             freezeThreshold = freezeThreshold.coerceIn(0f, 1f),
             protectThreshold = protectThreshold.coerceIn(0f, 1f),
             recentAppProtectionWindow = recentAppProtectionWindow.coerceIn(0, 50),
-            maxAppsToFreezePerCycle = maxAppsToFreezePerCycle.coerceIn(0, 25)
+            maxAppsToFreezePerCycle = maxAppsToFreezePerCycle.coerceIn(0, 25),
+            predictionIntervalSeconds = predictionIntervalSeconds.coerceIn(30, 3600)
         )
     }
 
@@ -107,6 +110,8 @@ data class DecisionPolicy(
         const val DEFAULT_RECENT_APP_PROTECTION_WINDOW = 10
         const val DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE = 3
         const val DEFAULT_DRY_RUN_ENABLED = true
+        const val DEFAULT_PREDICTION_INTERVAL_SECONDS = 60
+        const val DEFAULT_PAUSE_WHEN_BATTERY_LOW = true
         const val PROTECTED_TOP_PREDICTIONS = 5
     }
 }
@@ -142,6 +147,7 @@ data class PredictionUiState(
     val usageAccessEnabled: Boolean = false,
     val isLoading: Boolean = false,
     val isInventoryLoading: Boolean = false,
+    val isBackgroundServiceRunning: Boolean = false,
     val showAllInstalledApps: Boolean = false,
     val protectedAllowlist: Set<String> = emptySet(),
     val dryRunFrozenPackages: Set<String> = emptySet(),

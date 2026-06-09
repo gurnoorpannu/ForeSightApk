@@ -48,6 +48,14 @@ class AppPolicyStore(context: Context) {
             dryRunEnabled = preferences.getBoolean(
                 KEY_DRY_RUN_ENABLED,
                 DecisionPolicy.DEFAULT_DRY_RUN_ENABLED
+            ),
+            predictionIntervalSeconds = preferences.getInt(
+                KEY_PREDICTION_INTERVAL_SECONDS,
+                DecisionPolicy.DEFAULT_PREDICTION_INTERVAL_SECONDS
+            ),
+            pauseWhenBatteryLow = preferences.getBoolean(
+                KEY_PAUSE_WHEN_BATTERY_LOW,
+                DecisionPolicy.DEFAULT_PAUSE_WHEN_BATTERY_LOW
             )
         ).sanitized()
     }
@@ -60,6 +68,8 @@ class AppPolicyStore(context: Context) {
             .putInt(KEY_RECENT_APP_WINDOW, cleanPolicy.recentAppProtectionWindow)
             .putInt(KEY_MAX_FREEZE_PER_CYCLE, cleanPolicy.maxAppsToFreezePerCycle)
             .putBoolean(KEY_DRY_RUN_ENABLED, cleanPolicy.dryRunEnabled)
+            .putInt(KEY_PREDICTION_INTERVAL_SECONDS, cleanPolicy.predictionIntervalSeconds)
+            .putBoolean(KEY_PAUSE_WHEN_BATTERY_LOW, cleanPolicy.pauseWhenBatteryLow)
             .apply()
         ForeSightLog.info("Saved decision policy: $cleanPolicy")
     }
@@ -164,6 +174,8 @@ class AppPolicyStore(context: Context) {
         private const val KEY_RECENT_APP_WINDOW = "recent_app_protection_window"
         private const val KEY_MAX_FREEZE_PER_CYCLE = "max_apps_to_freeze_per_cycle"
         private const val KEY_DRY_RUN_ENABLED = "dry_run_enabled"
+        private const val KEY_PREDICTION_INTERVAL_SECONDS = "prediction_interval_seconds"
+        private const val KEY_PAUSE_WHEN_BATTERY_LOW = "pause_when_battery_low"
         private const val KEY_ACTION_HISTORY = "dry_run_action_history"
         private const val MAX_ACTION_HISTORY = 100
     }

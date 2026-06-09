@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -102,6 +103,8 @@ class MainActivity : ComponentActivity() {
                     onPolicyChange = ::updateDecisionPolicy,
                     onResetPolicyDefaults = ::resetDecisionPolicyDefaults,
                     onClearDryRunLogs = ::clearDryRunLogs,
+                    onStartBackgroundService = ::startBackgroundService,
+                    onStopBackgroundService = ::stopBackgroundService,
                     onSelectMappingPackage = { packageName, vocabLabel ->
                         overridePackageText = packageName
                         overrideVocabLabelText = vocabLabel.orEmpty()
@@ -117,6 +120,9 @@ class MainActivity : ComponentActivity() {
         ForeSightLog.debug("MainActivity resumed; checking Usage Access")
         if (::usageEventReader.isInitialized) {
             refreshUsageAccessState()
+        }
+        if (::policyStore.isInitialized) {
+            refreshPolicyState()
         }
         if (
             ::appInventoryReader.isInitialized &&
@@ -169,6 +175,7 @@ class MainActivity : ComponentActivity() {
     private fun refreshPolicyState() {
         if (!::policyStore.isInitialized) return
         uiState = uiState.copy(
+            isBackgroundServiceRunning = ForeSightBackgroundService.isRunning,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
             dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
             decisionPolicy = policyStore.getDecisionPolicy(),
@@ -371,6 +378,30 @@ class MainActivity : ComponentActivity() {
             dryRunActionHistory = emptyList(),
             errorMessage = null,
             diagnostics = uiState.diagnostics + "Cleared dry-run logs."
+        )
+    }
+
+    private fun startBackgroundService() {
+        val intent = Intent(this, ForeSightBackgroundService::class.java)
+            .setAction(ForeSightBackgroundService.ACTION_START)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        uiState = uiState.copy(
+            isBackgroundServiceRunning = true,
+            diagnostics = uiState.diagnostics + "Started background prediction service."
+        )
+    }
+
+    private fun stopBackgroundService() {
+        val intent = Intent(this, ForeSightBackgroundService::class.java)
+            .setAction(ForeSightBackgroundService.ACTION_STOP)
+        startService(intent)
+        uiState = uiState.copy(
+            isBackgroundServiceRunning = false,
+            diagnostics = uiState.diagnostics + "Stopped background prediction service."
         )
     }
 
@@ -646,6 +677,8 @@ private fun ForeSightScreen(
     onPolicyChange: (DecisionPolicy) -> Unit,
     onResetPolicyDefaults: () -> Unit,
     onClearDryRunLogs: () -> Unit,
+    onStartBackgroundService: () -> Unit,
+    onStopBackgroundService: () -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -789,10 +822,13 @@ private fun ForeSightScreen(
                 4 -> {
                     item {
                         PolicySettingsCard(
+                            serviceRunning = state.isBackgroundServiceRunning,
                             policy = state.decisionPolicy,
                             onPolicyChange = onPolicyChange,
                             onResetPolicyDefaults = onResetPolicyDefaults,
-                            onClearDryRunLogs = onClearDryRunLogs
+                            onClearDryRunLogs = onClearDryRunLogs,
+                            onStartBackgroundService = onStartBackgroundService,
+                            onStopBackgroundService = onStopBackgroundService
                         )
                     }
                     item {
@@ -923,12 +959,34 @@ private fun DecisionsCard(state: PredictionUiState) {
 
 @Composable
 private fun PolicySettingsCard(
+    serviceRunning: Boolean,
     policy: DecisionPolicy,
     onPolicyChange: (DecisionPolicy) -> Unit,
     onResetPolicyDefaults: () -> Unit,
-    onClearDryRunLogs: () -> Unit
+    onClearDryRunLogs: () -> Unit,
+    onStartBackgroundService: () -> Unit,
+    onStopBackgroundService: () -> Unit
 ) {
     SectionCard(title = "Dry-Run Policy") {
+        Text(
+            text = if (serviceRunning) "Background service: running" else "Background service: stopped",
+            fontWeight = FontWeight.Medium
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onStartBackgroundService,
+                enabled = !serviceRunning
+            ) {
+                Text("Start Service")
+            }
+            TextButton(
+                onClick = onStopBackgroundService,
+                enabled = serviceRunning
+            ) {
+                Text("Stop Service")
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
@@ -945,6 +1003,25 @@ private fun PolicySettingsCard(
                 checked = policy.dryRunEnabled,
                 onCheckedChange = { enabled ->
                     onPolicyChange(policy.copy(dryRunEnabled = enabled))
+                }
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Pause when battery low", fontWeight = FontWeight.Medium)
+                Text(
+                    text = "The background loop skips cycles while unplugged and low.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = policy.pauseWhenBatteryLow,
+                onCheckedChange = { enabled ->
+                    onPolicyChange(policy.copy(pauseWhenBatteryLow = enabled))
                 }
             )
         }
@@ -973,9 +1050,18 @@ private fun PolicySettingsCard(
             max = 25,
             onValueChange = { value -> onPolicyChange(policy.copy(maxAppsToFreezePerCycle = value)) }
         )
+        PolicyIntStepper(
+            title = "Prediction interval seconds",
+            value = policy.predictionIntervalSeconds,
+            min = 30,
+            max = 3600,
+            step = 30,
+            onValueChange = { value -> onPolicyChange(policy.copy(predictionIntervalSeconds = value)) }
+        )
 
         Text("Default max would-freeze apps: ${DecisionPolicy.DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE}")
         Text("Default protected recent apps: ${DecisionPolicy.DEFAULT_RECENT_APP_PROTECTION_WINDOW}")
+        Text("Default prediction interval: ${DecisionPolicy.DEFAULT_PREDICTION_INTERVAL_SECONDS}s")
         Text("Protected top predictions: ${DecisionPolicy.PROTECTED_TOP_PREDICTIONS}")
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1024,6 +1110,7 @@ private fun PolicyIntStepper(
     value: Int,
     min: Int,
     max: Int,
+    step: Int = 1,
     onValueChange: (Int) -> Unit
 ) {
     Row(
@@ -1039,10 +1126,10 @@ private fun PolicyIntStepper(
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextButton(onClick = { onValueChange((value - 1).coerceIn(min, max)) }) {
+            TextButton(onClick = { onValueChange((value - step).coerceIn(min, max)) }) {
                 Text("-")
             }
-            TextButton(onClick = { onValueChange((value + 1).coerceIn(min, max)) }) {
+            TextButton(onClick = { onValueChange((value + step).coerceIn(min, max)) }) {
                 Text("+")
             }
         }
@@ -1277,6 +1364,14 @@ private fun StatusCard(
             state.latencyMs?.let { latency ->
                 Text("Inference latency: ${latency}ms")
             }
+            Text(
+                text = if (state.isBackgroundServiceRunning) {
+                    "Background loop: running"
+                } else {
+                    "Background loop: stopped"
+                }
+            )
+            Text("Prediction interval: ${state.decisionPolicy.predictionIntervalSeconds}s")
             state.lastUpdatedText?.let { updated ->
                 Text("Last refresh: $updated")
             }
