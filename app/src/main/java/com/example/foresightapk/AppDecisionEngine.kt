@@ -1,19 +1,27 @@
 package com.example.foresightapk
 
 object AppDecisionEngine {
-    private const val PREDICTION_PROTECT_THRESHOLD = 0.03f
-
     fun buildPlan(
         predictions: List<PredictedApp>,
         installedApps: List<InstalledAppInfo>,
         recentApps: List<AppLaunch>,
         protectedAllowlist: Set<String>,
         dryRunFrozenPackages: Set<String>,
-        ownPackageName: String
+        ownPackageName: String,
+        policy: DecisionPolicy
     ): DecisionPlan {
-        val recentPackages = recentApps.map { it.packageName }.toSet()
+        val cleanPolicy = policy.sanitized()
+        val recentPackages = recentApps
+            .takeLast(cleanPolicy.recentAppProtectionWindow)
+            .map { it.packageName }
+            .toSet()
         val predictedTargets = predictions
-            .filter { it.confidence >= PREDICTION_PROTECT_THRESHOLD }
+            .withIndex()
+            .filter { indexedPrediction ->
+                indexedPrediction.index < DecisionPolicy.PROTECTED_TOP_PREDICTIONS ||
+                    indexedPrediction.value.confidence >= cleanPolicy.protectThreshold
+            }
+            .map { it.value }
             .mapNotNull { prediction ->
                 installedApps.bestTargetFor(prediction)?.let { app -> prediction to app }
             }
@@ -26,7 +34,7 @@ object AppDecisionEngine {
             }.confidence
         }
 
-        val decisions = installedApps
+        val preliminaryDecisions = installedApps
             .asSequence()
             .sortedWith(
                 compareByDescending<InstalledAppInfo> { it.packageName in predictedPackages }
@@ -42,14 +50,35 @@ object AppDecisionEngine {
                     predictedConfidenceByPackage = predictedConfidenceByPackage,
                     protectedAllowlist = protectedAllowlist,
                     dryRunFrozenPackages = dryRunFrozenPackages,
-                    ownPackageName = ownPackageName
+                    ownPackageName = ownPackageName,
+                    policy = cleanPolicy
                 )
             }
             .toList()
+        var remainingFreezeBudget = cleanPolicy.maxAppsToFreezePerCycle
+        val decisions = preliminaryDecisions.map { decision ->
+            if (decision.action != DecisionAction.WOULD_FREEZE) {
+                decision
+            } else if (remainingFreezeBudget > 0) {
+                remainingFreezeBudget -= 1
+                decision
+            } else {
+                decision.copy(
+                    action = DecisionAction.IGNORE,
+                    reason = DecisionReason.MaxFreezeLimitReached,
+                    reasonDetail = "Max would-freeze limit reached for this dry-run cycle."
+                )
+            }
+        }
 
         val diagnostics = listOf(
             "Policy mode: dry run only; no freeze or unfreeze command is executed.",
-            "Prediction protect threshold: ${"%.2f".format(PREDICTION_PROTECT_THRESHOLD)}.",
+            "Dry-run enabled: ${cleanPolicy.dryRunEnabled}.",
+            "Freeze threshold: ${"%.2f".format(cleanPolicy.freezeThreshold)}.",
+            "Protect threshold: ${"%.2f".format(cleanPolicy.protectThreshold)}.",
+            "Recent-app protection window: ${cleanPolicy.recentAppProtectionWindow}.",
+            "Max apps to freeze per cycle: ${cleanPolicy.maxAppsToFreezePerCycle}.",
+            "Protected top predictions: ${DecisionPolicy.PROTECTED_TOP_PREDICTIONS}.",
             "Protected allowlist packages: ${protectedAllowlist.size}.",
             "Previously frozen dry-run packages: ${dryRunFrozenPackages.size}.",
             "Predicted package targets: ${predictedPackages.size}."
@@ -82,11 +111,21 @@ object AppDecisionEngine {
         predictedConfidenceByPackage: Map<String, Float>,
         protectedAllowlist: Set<String>,
         dryRunFrozenPackages: Set<String>,
-        ownPackageName: String
+        ownPackageName: String,
+        policy: DecisionPolicy
     ): AppDecision {
         val confidence = predictedConfidenceByPackage[app.packageName]
         val modelLabel = app.mappedModelLabel
         val modelAppId = app.mappedModelAppId
+
+        if (!policy.dryRunEnabled) {
+            return app.decision(
+                action = DecisionAction.IGNORE,
+                confidence = confidence,
+                reason = DecisionReason.DryRunDisabled,
+                detail = "Dry-run decisions are disabled in policy settings."
+            )
+        }
 
         if (app.packageName in predictedPackages && app.packageName in dryRunFrozenPackages) {
             return app.decision(
@@ -144,6 +183,17 @@ object AppDecisionEngine {
                 confidence = confidence,
                 reason = DecisionReason.AlreadyDryRunFrozen,
                 detail = "Already marked frozen in dry-run state and not predicted soon."
+            )
+        }
+
+        val effectiveConfidence = confidence ?: 0f
+        if (effectiveConfidence > policy.freezeThreshold) {
+            return app.decision(
+                action = DecisionAction.IGNORE,
+                confidence = confidence,
+                reason = DecisionReason.AboveFreezeThreshold,
+                detail = "Confidence ${"%.3f".format(effectiveConfidence)} is above freeze threshold " +
+                    "${"%.3f".format(policy.freezeThreshold)}."
             )
         }
 

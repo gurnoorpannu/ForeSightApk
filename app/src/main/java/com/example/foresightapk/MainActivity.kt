@@ -36,6 +36,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -98,6 +99,9 @@ class MainActivity : ComponentActivity() {
                     onClearMappingOverride = ::clearMappingOverride,
                     onAddProtectedPackage = ::addProtectedPackage,
                     onRemoveProtectedPackage = ::removeProtectedPackage,
+                    onPolicyChange = ::updateDecisionPolicy,
+                    onResetPolicyDefaults = ::resetDecisionPolicyDefaults,
+                    onClearDryRunLogs = ::clearDryRunLogs,
                     onSelectMappingPackage = { packageName, vocabLabel ->
                         overridePackageText = packageName
                         overrideVocabLabelText = vocabLabel.orEmpty()
@@ -166,7 +170,9 @@ class MainActivity : ComponentActivity() {
         if (!::policyStore.isInitialized) return
         uiState = uiState.copy(
             protectedAllowlist = policyStore.getProtectedAllowlist(),
-            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages()
+            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
+            decisionPolicy = policyStore.getDecisionPolicy(),
+            dryRunActionHistory = policyStore.getRecentActionLogs()
         )
     }
 
@@ -326,9 +332,45 @@ class MainActivity : ComponentActivity() {
         uiState = uiState.copy(
             protectedAllowlist = updatedAllowlist,
             dryRunFrozenPackages = updatedFrozen,
+            decisionPolicy = policyStore.getDecisionPolicy(),
+            dryRunActionHistory = policyStore.getRecentActionLogs(),
             decisionPlan = decisionPlan,
             errorMessage = null,
             diagnostics = uiState.diagnostics + message
+        )
+    }
+
+    private fun updateDecisionPolicy(policy: DecisionPolicy) {
+        policyStore.saveDecisionPolicy(policy)
+        val decisionPlan = if (uiState.predictions.isNotEmpty()) {
+            buildDecisionPlan(
+                predictions = uiState.predictions,
+                installedApps = uiState.installedApps,
+                recentApps = uiState.recentApps
+            )
+        } else {
+            uiState.decisionPlan
+        }
+        uiState = uiState.copy(
+            decisionPolicy = policyStore.getDecisionPolicy(),
+            decisionPlan = decisionPlan,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Updated dry-run policy settings."
+        )
+    }
+
+    private fun resetDecisionPolicyDefaults() {
+        policyStore.resetDecisionPolicyDefaults()
+        updateDecisionPolicy(policyStore.getDecisionPolicy())
+    }
+
+    private fun clearDryRunLogs() {
+        policyStore.clearActionLogs()
+        predictionLogger.clearDryRunLogs()
+        uiState = uiState.copy(
+            dryRunActionHistory = emptyList(),
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Cleared dry-run logs."
         )
     }
 
@@ -407,9 +449,11 @@ class MainActivity : ComponentActivity() {
                         recentApps = prediction.recentApps
                     )
                     policyStore.applyDecisionPlan(decisionPlan)
+                    val actionLogs = policyStore.recordActionLogs(decisionPlan)
                     val updatedFrozenPackages = policyStore.getDryRunFrozenPackages()
                     runCatching {
                         predictionLogger.logDecisionPlan(decisionPlan)
+                        predictionLogger.logDryRunActions(actionLogs)
                     }.onFailure { logError ->
                         ForeSightLog.warn("Decision dry run succeeded but local logging failed", logError)
                         predictionLogger.logError(
@@ -427,6 +471,8 @@ class MainActivity : ComponentActivity() {
                         decisionPlan = decisionPlan,
                         protectedAllowlist = policyStore.getProtectedAllowlist(),
                         dryRunFrozenPackages = updatedFrozenPackages,
+                        decisionPolicy = policyStore.getDecisionPolicy(),
+                        dryRunActionHistory = policyStore.getRecentActionLogs(),
                         latencyMs = prediction.latencyMs,
                         lastUpdatedText = timestampText(),
                         diagnostics = prediction.diagnostics + decisionPlan.diagnostics,
@@ -544,7 +590,8 @@ class MainActivity : ComponentActivity() {
             recentApps = recentApps,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
             dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
-            ownPackageName = packageName
+            ownPackageName = packageName,
+            policy = policyStore.getDecisionPolicy()
         )
     }
 
@@ -596,6 +643,9 @@ private fun ForeSightScreen(
     onClearMappingOverride: (String) -> Unit,
     onAddProtectedPackage: (String) -> Unit,
     onRemoveProtectedPackage: (String) -> Unit,
+    onPolicyChange: (DecisionPolicy) -> Unit,
+    onResetPolicyDefaults: () -> Unit,
+    onClearDryRunLogs: () -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -738,10 +788,11 @@ private fun ForeSightScreen(
 
                 4 -> {
                     item {
-                        StatusCard(
-                            state = state,
-                            onRefresh = onRefresh,
-                            onOpenUsageSettings = onOpenUsageSettings
+                        PolicySettingsCard(
+                            policy = state.decisionPolicy,
+                            onPolicyChange = onPolicyChange,
+                            onResetPolicyDefaults = onResetPolicyDefaults,
+                            onClearDryRunLogs = onClearDryRunLogs
                         )
                     }
                     item {
@@ -796,6 +847,10 @@ private fun activeTabLabel(selectedTab: Int): String {
     }
 }
 
+private fun formatTimestamp(timestampMillis: Long): String {
+    return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestampMillis))
+}
+
 @Composable
 private fun DecisionsCard(state: PredictionUiState) {
     SectionCard(title = "Decision Dry Run") {
@@ -817,7 +872,9 @@ private fun DecisionsCard(state: PredictionUiState) {
         Text("Ignored: $ignoredCount")
         Text("Manual allowlist: ${state.protectedAllowlist.size}")
         Text("Dry-run frozen: ${state.dryRunFrozenPackages.size}")
+        Text("Last decision cycle: ${formatTimestamp(plan.timestampMillis)}")
         Text("Decision log: ${state.decisionLogFileName}")
+        Text("Action log: ${state.actionLogFileName}")
 
         plan.diagnostics.forEach { diagnostic ->
             Text("- $diagnostic")
@@ -842,6 +899,183 @@ private fun DecisionsCard(state: PredictionUiState) {
                 title = "Ignored",
                 decisions = plan.decisions.filter { it.action == DecisionAction.IGNORE },
                 displayLimit = 20
+            )
+        }
+
+        Text(
+            text = "Recent Dry-Run Actions (${state.dryRunActionHistory.size})",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        if (state.dryRunActionHistory.isEmpty()) {
+            Text("No dry-run action history yet.")
+        } else {
+            state.dryRunActionHistory.take(20).forEachIndexed { index, log ->
+                DryRunActionLogRow(log)
+                if (index != state.dryRunActionHistory.take(20).lastIndex) HorizontalDivider()
+            }
+            if (state.dryRunActionHistory.size > 20) {
+                Text("Showing 20 of ${state.dryRunActionHistory.size}.")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PolicySettingsCard(
+    policy: DecisionPolicy,
+    onPolicyChange: (DecisionPolicy) -> Unit,
+    onResetPolicyDefaults: () -> Unit,
+    onClearDryRunLogs: () -> Unit
+) {
+    SectionCard(title = "Dry-Run Policy") {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Dry-run enabled", fontWeight = FontWeight.Medium)
+                Text(
+                    text = "No root commands are ever executed in this phase.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = policy.dryRunEnabled,
+                onCheckedChange = { enabled ->
+                    onPolicyChange(policy.copy(dryRunEnabled = enabled))
+                }
+            )
+        }
+
+        PolicyFloatStepper(
+            title = "Freeze threshold",
+            value = policy.freezeThreshold,
+            onValueChange = { value -> onPolicyChange(policy.copy(freezeThreshold = value)) }
+        )
+        PolicyFloatStepper(
+            title = "Protect threshold",
+            value = policy.protectThreshold,
+            onValueChange = { value -> onPolicyChange(policy.copy(protectThreshold = value)) }
+        )
+        PolicyIntStepper(
+            title = "Recent-app protection window",
+            value = policy.recentAppProtectionWindow,
+            min = 0,
+            max = 50,
+            onValueChange = { value -> onPolicyChange(policy.copy(recentAppProtectionWindow = value)) }
+        )
+        PolicyIntStepper(
+            title = "Max apps to freeze per cycle",
+            value = policy.maxAppsToFreezePerCycle,
+            min = 0,
+            max = 25,
+            onValueChange = { value -> onPolicyChange(policy.copy(maxAppsToFreezePerCycle = value)) }
+        )
+
+        Text("Default max would-freeze apps: ${DecisionPolicy.DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE}")
+        Text("Default protected recent apps: ${DecisionPolicy.DEFAULT_RECENT_APP_PROTECTION_WINDOW}")
+        Text("Protected top predictions: ${DecisionPolicy.PROTECTED_TOP_PREDICTIONS}")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onResetPolicyDefaults) {
+                Text("Reset Policy Defaults")
+            }
+            TextButton(onClick = onClearDryRunLogs) {
+                Text("Clear Logs")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PolicyFloatStepper(
+    title: String,
+    value: Float,
+    onValueChange: (Float) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(
+                text = "%.2f".format(value),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { onValueChange((value - 0.01f).coerceIn(0f, 1f)) }) {
+                Text("-")
+            }
+            TextButton(onClick = { onValueChange((value + 0.01f).coerceIn(0f, 1f)) }) {
+                Text("+")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PolicyIntStepper(
+    title: String,
+    value: Int,
+    min: Int,
+    max: Int,
+    onValueChange: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(
+                text = value.toString(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = { onValueChange((value - 1).coerceIn(min, max)) }) {
+                Text("-")
+            }
+            TextButton(onClick = { onValueChange((value + 1).coerceIn(min, max)) }) {
+                Text("+")
+            }
+        }
+    }
+}
+
+@Composable
+private fun DryRunActionLogRow(log: DryRunActionLog) {
+    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        Text(
+            text = "${log.action.displayName}: ${log.appLabel}",
+            fontWeight = FontWeight.Medium
+        )
+        Text(
+            text = "${formatTimestamp(log.timestampMillis)} · ${log.mode.displayName}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = log.packageName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Reason: ${log.reason.displayName}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        log.predictionConfidence?.let { confidence ->
+            Text(
+                text = "Confidence: ${"%.3f".format(confidence)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
@@ -1048,6 +1282,7 @@ private fun StatusCard(
             }
             Text("Prediction log: ${state.logFileName}")
             Text("Decision log: ${state.decisionLogFileName}")
+            Text("Action log: ${state.actionLogFileName}")
             Text("Error log: ${state.errorLogFileName}")
             Text("Logcat tag: ${ForeSightLog.TAG}")
 

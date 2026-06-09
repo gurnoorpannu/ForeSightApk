@@ -64,6 +64,28 @@ class PredictionLogger(private val context: Context) {
         )
     }
 
+    fun logDryRunActions(logs: List<DryRunActionLog>) {
+        logs.forEach { log ->
+            val payload = JSONObject()
+                .put("timestamp", log.timestampMillis)
+                .put("package_name", log.packageName)
+                .put("app_label", log.appLabel)
+                .put("action", log.action.displayName)
+                .put("reason", log.reason.displayName)
+                .put("prediction_confidence", log.predictionConfidence?.toDouble())
+                .put("mode", log.mode.displayName)
+
+            appendJsonLine(ACTION_FILE_NAME, payload)
+        }
+        ForeSightLog.info("Logged dry-run actions: count=${logs.size}")
+    }
+
+    fun clearDryRunLogs() {
+        context.deleteFile(ACTION_FILE_NAME)
+        context.deleteFile(DECISION_FILE_NAME)
+        ForeSightLog.info("Cleared dry-run log files")
+    }
+
     fun logError(stage: String, throwable: Throwable, diagnostics: List<String> = emptyList()) {
         val payload = JSONObject()
             .put("timestamp", System.currentTimeMillis())
@@ -92,6 +114,7 @@ class PredictionLogger(private val context: Context) {
     companion object {
         const val PREDICTION_FILE_NAME = "prediction_events.jsonl"
         const val DECISION_FILE_NAME = "decision_events.jsonl"
+        const val ACTION_FILE_NAME = "dry_run_action_events.jsonl"
         const val ERROR_FILE_NAME = "foresight_errors.jsonl"
     }
 }
