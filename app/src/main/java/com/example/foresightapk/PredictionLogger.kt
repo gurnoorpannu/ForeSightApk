@@ -33,6 +33,37 @@ class PredictionLogger(private val context: Context) {
         )
     }
 
+    fun logDecisionPlan(plan: DecisionPlan) {
+        val payload = JSONObject()
+            .put("timestamp", plan.timestampMillis)
+            .put("predictions_seen", plan.predictionsSeen)
+            .put("installed_apps_seen", plan.installedAppsSeen)
+            .put("recent_apps_seen", plan.recentAppsSeen)
+            .put(
+                "decisions",
+                JSONArray(
+                    plan.decisions.map { decision ->
+                        JSONObject()
+                            .put("action", decision.action.displayName)
+                            .put("package_name", decision.packageName)
+                            .put("app_label", decision.appLabel)
+                            .put("model_app_id", decision.modelAppId)
+                            .put("model_label", decision.modelLabel)
+                            .put("confidence", decision.confidence?.toDouble())
+                            .put("reason", decision.reason.displayName)
+                            .put("reason_detail", decision.reasonDetail)
+                    }
+                )
+            )
+            .put("diagnostics", JSONArray(plan.diagnostics))
+
+        appendJsonLine(DECISION_FILE_NAME, payload)
+        ForeSightLog.info(
+            "Logged decision dry run: decisions=${plan.decisions.size}, " +
+                "installedApps=${plan.installedAppsSeen}"
+        )
+    }
+
     fun logError(stage: String, throwable: Throwable, diagnostics: List<String> = emptyList()) {
         val payload = JSONObject()
             .put("timestamp", System.currentTimeMillis())
@@ -60,6 +91,7 @@ class PredictionLogger(private val context: Context) {
 
     companion object {
         const val PREDICTION_FILE_NAME = "prediction_events.jsonl"
+        const val DECISION_FILE_NAME = "decision_events.jsonl"
         const val ERROR_FILE_NAME = "foresight_errors.jsonl"
     }
 }

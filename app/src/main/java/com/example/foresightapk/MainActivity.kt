@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var predictionLogger: PredictionLogger
     private lateinit var appInventoryReader: AppInventoryReader
     private lateinit var mappingStore: AppMappingStore
+    private lateinit var policyStore: AppPolicyStore
     private var uiState by mutableStateOf(PredictionUiState())
     private var overridePackageText by mutableStateOf("")
     private var overrideVocabLabelText by mutableStateOf("")
@@ -76,7 +77,9 @@ class MainActivity : ComponentActivity() {
         usageEventReader = UsageEventReader(this)
         predictionLogger = PredictionLogger(this)
         mappingStore = AppMappingStore(this)
+        policyStore = AppPolicyStore(this)
         appInventoryReader = AppInventoryReader(this, mappingStore)
+        refreshPolicyState()
 
         enableEdgeToEdge()
         setContent {
@@ -93,6 +96,8 @@ class MainActivity : ComponentActivity() {
                     onOverrideVocabLabelChange = { overrideVocabLabelText = it },
                     onSaveMappingOverride = ::saveMappingOverride,
                     onClearMappingOverride = ::clearMappingOverride,
+                    onAddProtectedPackage = ::addProtectedPackage,
+                    onRemoveProtectedPackage = ::removeProtectedPackage,
                     onSelectMappingPackage = { packageName, vocabLabel ->
                         overridePackageText = packageName
                         overrideVocabLabelText = vocabLabel.orEmpty()
@@ -157,6 +162,14 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun refreshPolicyState() {
+        if (!::policyStore.isInitialized) return
+        uiState = uiState.copy(
+            protectedAllowlist = policyStore.getProtectedAllowlist(),
+            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages()
+        )
+    }
+
     private fun setInventoryScope(showAllInstalledApps: Boolean) {
         if (uiState.showAllInstalledApps == showAllInstalledApps && uiState.installedApps.isNotEmpty()) {
             return
@@ -191,9 +204,19 @@ class MainActivity : ComponentActivity() {
                 onSuccess = { installedApps ->
                     val mappedCount = installedApps.count { it.mappedModelAppId != null }
                     val launchableCount = installedApps.count { it.isLaunchable }
+                    val decisionPlan = if (uiState.predictions.isNotEmpty()) {
+                        buildDecisionPlan(
+                            predictions = uiState.predictions,
+                            installedApps = installedApps,
+                            recentApps = uiState.recentApps
+                        )
+                    } else {
+                        uiState.decisionPlan
+                    }
                     uiState.copy(
                         isInventoryLoading = false,
                         installedApps = installedApps,
+                        decisionPlan = decisionPlan,
                         diagnostics = uiState.diagnostics + listOf(
                             "App inventory loaded: ${installedApps.size} apps ($scopeName scope).",
                             "Inventory launchable apps: $launchableCount.",
@@ -266,6 +289,49 @@ class MainActivity : ComponentActivity() {
         refreshAppInventory()
     }
 
+    private fun addProtectedPackage(packageName: String) {
+        val cleanPackageName = packageName.trim()
+        if (cleanPackageName.isEmpty()) {
+            uiState = uiState.copy(errorMessage = "Select a package before adding it to the allowlist.")
+            return
+        }
+
+        policyStore.addProtectedPackage(cleanPackageName)
+        updatePolicyStateAfterManualChange("Protected allowlist added: $cleanPackageName.")
+    }
+
+    private fun removeProtectedPackage(packageName: String) {
+        val cleanPackageName = packageName.trim()
+        if (cleanPackageName.isEmpty()) {
+            uiState = uiState.copy(errorMessage = "Select a package before removing it from the allowlist.")
+            return
+        }
+
+        policyStore.removeProtectedPackage(cleanPackageName)
+        updatePolicyStateAfterManualChange("Protected allowlist removed: $cleanPackageName.")
+    }
+
+    private fun updatePolicyStateAfterManualChange(message: String) {
+        val updatedAllowlist = policyStore.getProtectedAllowlist()
+        val updatedFrozen = policyStore.getDryRunFrozenPackages()
+        val decisionPlan = if (uiState.predictions.isNotEmpty()) {
+            buildDecisionPlan(
+                predictions = uiState.predictions,
+                installedApps = uiState.installedApps,
+                recentApps = uiState.recentApps
+            )
+        } else {
+            uiState.decisionPlan
+        }
+        uiState = uiState.copy(
+            protectedAllowlist = updatedAllowlist,
+            dryRunFrozenPackages = updatedFrozen,
+            decisionPlan = decisionPlan,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + message
+        )
+    }
+
     private fun runPrediction() {
         ForeSightLog.info("Refresh requested")
         val usageAccessEnabled = runCatching {
@@ -335,15 +401,35 @@ class MainActivity : ComponentActivity() {
 
             uiState = result.fold(
                 onSuccess = { prediction ->
+                    val decisionPlan = buildDecisionPlan(
+                        predictions = prediction.predictions,
+                        installedApps = uiState.installedApps,
+                        recentApps = prediction.recentApps
+                    )
+                    policyStore.applyDecisionPlan(decisionPlan)
+                    val updatedFrozenPackages = policyStore.getDryRunFrozenPackages()
+                    runCatching {
+                        predictionLogger.logDecisionPlan(decisionPlan)
+                    }.onFailure { logError ->
+                        ForeSightLog.warn("Decision dry run succeeded but local logging failed", logError)
+                        predictionLogger.logError(
+                            stage = "Decision dry-run logging",
+                            throwable = logError,
+                            diagnostics = decisionPlan.diagnostics
+                        )
+                    }
                     uiState.copy(
                         usageAccessEnabled = true,
                         isLoading = false,
                         recentApps = prediction.recentApps,
                         inputAppIds = prediction.inputAppIds,
                         predictions = prediction.predictions,
+                        decisionPlan = decisionPlan,
+                        protectedAllowlist = policyStore.getProtectedAllowlist(),
+                        dryRunFrozenPackages = updatedFrozenPackages,
                         latencyMs = prediction.latencyMs,
                         lastUpdatedText = timestampText(),
-                        diagnostics = prediction.diagnostics,
+                        diagnostics = prediction.diagnostics + decisionPlan.diagnostics,
                         errorMessage = if (prediction.recentApps.isEmpty()) {
                             "No recent app launches found yet. Open a few apps, then refresh."
                         } else {
@@ -447,6 +533,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun buildDecisionPlan(
+        predictions: List<PredictedApp>,
+        installedApps: List<InstalledAppInfo>,
+        recentApps: List<AppLaunch>
+    ): DecisionPlan {
+        return AppDecisionEngine.buildPlan(
+            predictions = predictions,
+            installedApps = installedApps,
+            recentApps = recentApps,
+            protectedAllowlist = policyStore.getProtectedAllowlist(),
+            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
+            ownPackageName = packageName
+        )
+    }
+
     private fun handleFailure(stage: String, throwable: Throwable, diagnostics: List<String>) {
         ForeSightLog.error("$stage failed: ${throwable.message}", throwable)
         if (::predictionLogger.isInitialized) {
@@ -493,6 +594,8 @@ private fun ForeSightScreen(
     onOverrideVocabLabelChange: (String) -> Unit,
     onSaveMappingOverride: (String, String) -> Unit,
     onClearMappingOverride: (String) -> Unit,
+    onAddProtectedPackage: (String) -> Unit,
+    onRemoveProtectedPackage: (String) -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -607,6 +710,8 @@ private fun ForeSightScreen(
                             onOverrideVocabLabelChange = onOverrideVocabLabelChange,
                             onSaveMappingOverride = onSaveMappingOverride,
                             onClearMappingOverride = onClearMappingOverride,
+                            onAddProtectedPackage = onAddProtectedPackage,
+                            onRemoveProtectedPackage = onRemoveProtectedPackage,
                             onSelectMappingPackage = onSelectMappingPackage
                         )
                     }
@@ -627,7 +732,7 @@ private fun ForeSightScreen(
 
                 3 -> {
                     item {
-                        DiagnosticsCard(state)
+                        DecisionsCard(state)
                     }
                 }
 
@@ -685,9 +790,125 @@ private fun activeTabLabel(selectedTab: Int): String {
         0 -> "Prediction"
         1 -> "Inventory"
         2 -> "Manual Mapping"
-        3 -> "Diagnostics"
+        3 -> "Decisions"
         4 -> "Settings"
         else -> "Prediction"
+    }
+}
+
+@Composable
+private fun DecisionsCard(state: PredictionUiState) {
+    SectionCard(title = "Decision Dry Run") {
+        val plan = state.decisionPlan
+        if (plan == null) {
+            Text("No decision plan yet. Run prediction first.")
+            return@SectionCard
+        }
+
+        val protectCount = plan.decisions.count { it.action == DecisionAction.PROTECT }
+        val unfreezeCount = plan.decisions.count { it.action == DecisionAction.WOULD_UNFREEZE }
+        val freezeCount = plan.decisions.count { it.action == DecisionAction.WOULD_FREEZE }
+        val ignoredCount = plan.decisions.count { it.action == DecisionAction.IGNORE }
+
+        Text("Mode: dry run only")
+        Text("Protected: $protectCount")
+        Text("Would unfreeze: $unfreezeCount")
+        Text("Would freeze: $freezeCount")
+        Text("Ignored: $ignoredCount")
+        Text("Manual allowlist: ${state.protectedAllowlist.size}")
+        Text("Dry-run frozen: ${state.dryRunFrozenPackages.size}")
+        Text("Decision log: ${state.decisionLogFileName}")
+
+        plan.diagnostics.forEach { diagnostic ->
+            Text("- $diagnostic")
+        }
+
+        if (plan.decisions.isEmpty()) {
+            Text("No app actions selected by policy.")
+        } else {
+            DecisionGroup(
+                title = "Protected",
+                decisions = plan.decisions.filter { it.action == DecisionAction.PROTECT }
+            )
+            DecisionGroup(
+                title = "Would Unfreeze",
+                decisions = plan.decisions.filter { it.action == DecisionAction.WOULD_UNFREEZE }
+            )
+            DecisionGroup(
+                title = "Would Freeze",
+                decisions = plan.decisions.filter { it.action == DecisionAction.WOULD_FREEZE }
+            )
+            DecisionGroup(
+                title = "Ignored",
+                decisions = plan.decisions.filter { it.action == DecisionAction.IGNORE },
+                displayLimit = 20
+            )
+        }
+    }
+}
+
+@Composable
+private fun DecisionGroup(
+    title: String,
+    decisions: List<AppDecision>,
+    displayLimit: Int = Int.MAX_VALUE
+) {
+    Text(
+        text = "$title (${decisions.size})",
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold
+    )
+    if (decisions.isEmpty()) {
+        Text("None")
+        return
+    }
+
+    val visibleDecisions = decisions.take(displayLimit)
+    visibleDecisions.forEachIndexed { index, decision ->
+        DecisionRow(decision)
+        if (index != visibleDecisions.lastIndex) HorizontalDivider()
+    }
+    if (decisions.size > visibleDecisions.size) {
+        Text("Showing ${visibleDecisions.size} of ${decisions.size}.")
+    }
+}
+
+@Composable
+private fun DecisionRow(decision: AppDecision) {
+    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        Text(
+            text = "${decision.action.displayName}: ${decision.appLabel}",
+            fontWeight = FontWeight.Medium
+        )
+        Text(
+            text = decision.packageName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        decision.modelAppId?.let { appId ->
+            Text(
+                text = "Model: ${decision.modelLabel ?: "App"} ($appId)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        decision.confidence?.let { confidence ->
+            Text(
+                text = "Confidence: ${"%.3f".format(confidence)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Text(
+            text = "Reason: ${decision.reason.displayName}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = decision.reasonDetail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -736,6 +957,8 @@ private fun AppInventoryCard(
     onOverrideVocabLabelChange: (String) -> Unit,
     onSaveMappingOverride: (String, String) -> Unit,
     onClearMappingOverride: (String) -> Unit,
+    onAddProtectedPackage: (String) -> Unit,
+    onRemoveProtectedPackage: (String) -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
 ) {
     SectionCard(title = "App Inventory") {
@@ -787,10 +1010,13 @@ private fun AppInventoryCard(
                 InstalledAppRow(
                     app = app,
                     isSelected = app.packageName == overridePackageText,
+                    isAllowlisted = app.packageName in state.protectedAllowlist,
                     vocabLabelText = overrideVocabLabelText,
                     onVocabLabelChange = onOverrideVocabLabelChange,
                     onSave = { onSaveMappingOverride(app.packageName, overrideVocabLabelText) },
                     onClear = { onClearMappingOverride(app.packageName) },
+                    onAddProtected = { onAddProtectedPackage(app.packageName) },
+                    onRemoveProtected = { onRemoveProtectedPackage(app.packageName) },
                     onSelectMappingPackage = onSelectMappingPackage
                 )
                 if (index != displayApps.lastIndex) HorizontalDivider()
@@ -821,6 +1047,7 @@ private fun StatusCard(
                 Text("Last refresh: $updated")
             }
             Text("Prediction log: ${state.logFileName}")
+            Text("Decision log: ${state.decisionLogFileName}")
             Text("Error log: ${state.errorLogFileName}")
             Text("Logcat tag: ${ForeSightLog.TAG}")
 
@@ -878,10 +1105,13 @@ private fun AppLaunchRow(index: Int, launch: AppLaunch) {
 private fun InstalledAppRow(
     app: InstalledAppInfo,
     isSelected: Boolean,
+    isAllowlisted: Boolean,
     vocabLabelText: String,
     onVocabLabelChange: (String) -> Unit,
     onSave: () -> Unit,
     onClear: () -> Unit,
+    onAddProtected: () -> Unit,
+    onRemoveProtected: () -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
 ) {
     Column(
@@ -908,10 +1138,10 @@ private fun InstalledAppRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                text = app.inventoryTypeText(),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+                    text = app.inventoryTypeText(isAllowlisted),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             TextButton(
                 onClick = {
@@ -938,6 +1168,17 @@ private fun InstalledAppRow(
                     Text("Clear")
                 }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (isAllowlisted) {
+                    TextButton(onClick = onRemoveProtected) {
+                        Text("Remove Protect")
+                    }
+                } else {
+                    Button(onClick = onAddProtected) {
+                        Text("Protect")
+                    }
+                }
+            }
         }
     }
 }
@@ -952,10 +1193,11 @@ private fun InstalledAppInfo.mappingSummary(): String {
     }
 }
 
-private fun InstalledAppInfo.inventoryTypeText(): String {
+private fun InstalledAppInfo.inventoryTypeText(isAllowlisted: Boolean): String {
     val appType = if (isSystemApp) "system app" else "user app"
     val launchableType = if (isLaunchable) "launchable" else "not launchable"
-    return "$appType, $launchableType"
+    val allowlistType = if (isAllowlisted) ", allowlisted" else ""
+    return "$appType, $launchableType$allowlistType"
 }
 
 @Composable
