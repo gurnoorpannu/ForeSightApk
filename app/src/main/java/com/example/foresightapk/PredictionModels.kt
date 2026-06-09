@@ -85,6 +85,50 @@ data class DryRunActionLog(
     val mode: ActionMode = ActionMode.DRY_RUN
 )
 
+data class ShadowPredictionEntry(
+    val label: String,
+    val appId: Int,
+    val confidence: Float,
+    val packageName: String?
+)
+
+data class ShadowPredictionCycle(
+    val timestampMillis: Long,
+    val recentApps: List<AppLaunch>,
+    val predictions: List<ShadowPredictionEntry>,
+    val inferenceLatencyMs: Long,
+    val unknownRecentAppCount: Int,
+    val dryRunFreezeCount: Int,
+    val wouldFreezePackages: Set<String>
+)
+
+data class ShadowEvaluation(
+    val predictionTimestampMillis: Long,
+    val actualNextApp: AppLaunch,
+    val top1Hit: Boolean,
+    val top3Hit: Boolean,
+    val top5Hit: Boolean,
+    val predictionToOpenLatencyMs: Long,
+    val inferenceLatencyMs: Long,
+    val unknownRecentAppCount: Int,
+    val recentAppCount: Int,
+    val dryRunFreezeCount: Int,
+    val unsafeWouldFreezeActualNextApp: Boolean
+)
+
+data class ShadowMetrics(
+    val evaluatedCycles: Int = 0,
+    val pendingCycles: Int = 0,
+    val top1Accuracy: Float = 0f,
+    val top3Accuracy: Float = 0f,
+    val top5Accuracy: Float = 0f,
+    val averageInferenceLatencyMs: Float = 0f,
+    val unknownAppRate: Float = 0f,
+    val dryRunFreezeCount: Int = 0,
+    val wouldHaveFrozenActualNextAppCount: Int = 0,
+    val recentUnsafeEvaluations: List<ShadowEvaluation> = emptyList()
+)
+
 data class DecisionPolicy(
     val freezeThreshold: Float = DEFAULT_FREEZE_THRESHOLD,
     val protectThreshold: Float = DEFAULT_PROTECT_THRESHOLD,
@@ -153,6 +197,8 @@ data class PredictionUiState(
     val dryRunFrozenPackages: Set<String> = emptySet(),
     val decisionPolicy: DecisionPolicy = DecisionPolicy(),
     val dryRunActionHistory: List<DryRunActionLog> = emptyList(),
+    val shadowMetrics: ShadowMetrics = ShadowMetrics(),
+    val shadowEvaluations: List<ShadowEvaluation> = emptyList(),
     val recentApps: List<AppLaunch> = emptyList(),
     val installedApps: List<InstalledAppInfo> = emptyList(),
     val inputAppIds: List<Long> = emptyList(),
@@ -165,5 +211,7 @@ data class PredictionUiState(
     val logFileName: String = PredictionLogger.PREDICTION_FILE_NAME,
     val decisionLogFileName: String = PredictionLogger.DECISION_FILE_NAME,
     val actionLogFileName: String = PredictionLogger.ACTION_FILE_NAME,
+    val shadowCycleLogFileName: String = ShadowEvaluationStore.CYCLE_FILE_NAME,
+    val shadowEvaluationLogFileName: String = ShadowEvaluationStore.EVALUATION_FILE_NAME,
     val errorLogFileName: String = PredictionLogger.ERROR_FILE_NAME
 )

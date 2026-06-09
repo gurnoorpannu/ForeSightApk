@@ -42,6 +42,7 @@ class ForeSightBackgroundService : Service() {
     private lateinit var predictionLogger: PredictionLogger
     private lateinit var appInventoryReader: AppInventoryReader
     private lateinit var policyStore: AppPolicyStore
+    private lateinit var shadowStore: ShadowEvaluationStore
     private var loopJob: Job? = null
     private var lastPredictionText: String = "not run yet"
 
@@ -51,6 +52,7 @@ class ForeSightBackgroundService : Service() {
         isRunning = true
         usageEventReader = UsageEventReader(this)
         predictionLogger = PredictionLogger(this)
+        shadowStore = ShadowEvaluationStore(this, usageEventReader)
         val mappingStore = AppMappingStore(this)
         policyStore = AppPolicyStore(this)
         appInventoryReader = AppInventoryReader(this, mappingStore)
@@ -143,6 +145,12 @@ class ForeSightBackgroundService : Service() {
         val actionLogs = policyStore.recordActionLogs(decisionPlan)
         predictionLogger.logDecisionPlan(decisionPlan)
         predictionLogger.logDryRunActions(actionLogs)
+        runCatching {
+            shadowStore.evaluatePendingCycles()
+            shadowStore.recordCycle(prediction, decisionPlan)
+        }.onFailure { error ->
+            ForeSightLog.warn("Background shadow evaluation logging failed", error)
+        }
 
         lastPredictionText = timestampText(decisionPlan.timestampMillis)
         updateNotification()

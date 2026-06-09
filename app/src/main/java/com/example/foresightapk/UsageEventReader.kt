@@ -36,6 +36,14 @@ class UsageEventReader(private val context: Context) {
         return result
     }
 
+    fun readFirstLaunchAfter(
+        timestampMillis: Long,
+        endMillis: Long = System.currentTimeMillis()
+    ): AppLaunch? {
+        if (endMillis <= timestampMillis) return null
+        return queryLaunches(timestampMillis + 1, endMillis).firstOrNull()
+    }
+
     private fun queryLaunches(startMillis: Long, endMillis: Long): List<AppLaunch> {
         val events = usageStatsManager.queryEvents(startMillis, endMillis)
         val event = UsageEvents.Event()

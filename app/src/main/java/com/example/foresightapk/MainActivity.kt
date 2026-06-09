@@ -69,6 +69,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var appInventoryReader: AppInventoryReader
     private lateinit var mappingStore: AppMappingStore
     private lateinit var policyStore: AppPolicyStore
+    private lateinit var shadowStore: ShadowEvaluationStore
     private var uiState by mutableStateOf(PredictionUiState())
     private var overridePackageText by mutableStateOf("")
     private var overrideVocabLabelText by mutableStateOf("")
@@ -80,6 +81,7 @@ class MainActivity : ComponentActivity() {
         predictionLogger = PredictionLogger(this)
         mappingStore = AppMappingStore(this)
         policyStore = AppPolicyStore(this)
+        shadowStore = ShadowEvaluationStore(this, usageEventReader)
         appInventoryReader = AppInventoryReader(this, mappingStore)
         refreshPolicyState()
 
@@ -103,6 +105,7 @@ class MainActivity : ComponentActivity() {
                     onPolicyChange = ::updateDecisionPolicy,
                     onResetPolicyDefaults = ::resetDecisionPolicyDefaults,
                     onClearDryRunLogs = ::clearDryRunLogs,
+                    onExportShadowLogs = ::exportShadowLogs,
                     onStartBackgroundService = ::startBackgroundService,
                     onStopBackgroundService = ::stopBackgroundService,
                     onSelectMappingPackage = { packageName, vocabLabel ->
@@ -174,13 +177,41 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshPolicyState() {
         if (!::policyStore.isInitialized) return
+        val (shadowMetrics, shadowEvaluations) = readShadowDashboard()
         uiState = uiState.copy(
             isBackgroundServiceRunning = ForeSightBackgroundService.isRunning,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
             dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
             decisionPolicy = policyStore.getDecisionPolicy(),
-            dryRunActionHistory = policyStore.getRecentActionLogs()
+            dryRunActionHistory = policyStore.getRecentActionLogs(),
+            shadowMetrics = shadowMetrics,
+            shadowEvaluations = shadowEvaluations
         )
+    }
+
+    private fun readShadowDashboard(): Pair<ShadowMetrics, List<ShadowEvaluation>> {
+        if (!::shadowStore.isInitialized) {
+            return uiState.shadowMetrics to uiState.shadowEvaluations
+        }
+        return runCatching {
+            shadowStore.getMetrics() to shadowStore.getRecentEvaluations()
+        }.getOrElse { error ->
+            ForeSightLog.warn("Could not read shadow evaluation dashboard", error)
+            uiState.shadowMetrics to uiState.shadowEvaluations
+        }
+    }
+
+    private fun recordShadowCycle(
+        prediction: PredictionResult,
+        decisionPlan: DecisionPlan
+    ) {
+        if (!::shadowStore.isInitialized) return
+        runCatching {
+            shadowStore.evaluatePendingCycles()
+            shadowStore.recordCycle(prediction, decisionPlan)
+        }.onFailure { error ->
+            ForeSightLog.warn("Shadow evaluation logging failed", error)
+        }
     }
 
     private fun setInventoryScope(showAllInstalledApps: Boolean) {
@@ -381,6 +412,35 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun exportShadowLogs() {
+        if (!::shadowStore.isInitialized) return
+        val uris = runCatching {
+            shadowStore.exportLogsToCache()
+        }.getOrElse { error ->
+            handleFailure(
+                stage = "Shadow log export",
+                throwable = error,
+                diagnostics = uiState.diagnostics
+            )
+            return
+        }
+
+        if (uris.isEmpty()) {
+            uiState = uiState.copy(
+                errorMessage = "No shadow logs to export yet.",
+                diagnostics = uiState.diagnostics + "Shadow log export skipped because no files exist yet."
+            )
+            return
+        }
+
+        val exportIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "application/json"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(exportIntent, "Export ForeSight shadow logs"))
+    }
+
     private fun startBackgroundService() {
         val intent = Intent(this, ForeSightBackgroundService::class.java)
             .setAction(ForeSightBackgroundService.ACTION_START)
@@ -493,6 +553,8 @@ class MainActivity : ComponentActivity() {
                             diagnostics = decisionPlan.diagnostics
                         )
                     }
+                    recordShadowCycle(prediction, decisionPlan)
+                    val (shadowMetrics, shadowEvaluations) = readShadowDashboard()
                     uiState.copy(
                         usageAccessEnabled = true,
                         isLoading = false,
@@ -504,6 +566,8 @@ class MainActivity : ComponentActivity() {
                         dryRunFrozenPackages = updatedFrozenPackages,
                         decisionPolicy = policyStore.getDecisionPolicy(),
                         dryRunActionHistory = policyStore.getRecentActionLogs(),
+                        shadowMetrics = shadowMetrics,
+                        shadowEvaluations = shadowEvaluations,
                         latencyMs = prediction.latencyMs,
                         lastUpdatedText = timestampText(),
                         diagnostics = prediction.diagnostics + decisionPlan.diagnostics,
@@ -677,6 +741,7 @@ private fun ForeSightScreen(
     onPolicyChange: (DecisionPolicy) -> Unit,
     onResetPolicyDefaults: () -> Unit,
     onClearDryRunLogs: () -> Unit,
+    onExportShadowLogs: () -> Unit,
     onStartBackgroundService: () -> Unit,
     onStopBackgroundService: () -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
@@ -817,6 +882,12 @@ private fun ForeSightScreen(
                     item {
                         DecisionsCard(state)
                     }
+                    item {
+                        ShadowEvaluationCard(
+                            state = state,
+                            onExportShadowLogs = onExportShadowLogs
+                        )
+                    }
                 }
 
                 4 -> {
@@ -887,6 +958,10 @@ private fun formatTimestamp(timestampMillis: Long): String {
     return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestampMillis))
 }
 
+private fun formatPercent(value: Float): String {
+    return "%.1f%%".format(value * 100f)
+}
+
 @Composable
 private fun DecisionsCard(state: PredictionUiState) {
     SectionCard(title = "Decision Dry Run") {
@@ -954,6 +1029,101 @@ private fun DecisionsCard(state: PredictionUiState) {
                 Text("Showing 20 of ${state.dryRunActionHistory.size}.")
             }
         }
+    }
+}
+
+@Composable
+private fun ShadowEvaluationCard(
+    state: PredictionUiState,
+    onExportShadowLogs: () -> Unit
+) {
+    val metrics = state.shadowMetrics
+    SectionCard(title = "Shadow Evaluation") {
+        Text("Evaluated cycles: ${metrics.evaluatedCycles}")
+        Text("Pending cycles: ${metrics.pendingCycles}")
+        Text("Top-1 accuracy: ${formatPercent(metrics.top1Accuracy)}")
+        Text("Top-3 accuracy: ${formatPercent(metrics.top3Accuracy)}")
+        Text("Top-5 accuracy: ${formatPercent(metrics.top5Accuracy)}")
+        Text("Average inference latency: ${"%.1f".format(metrics.averageInferenceLatencyMs)}ms")
+        Text("Unknown app rate: ${formatPercent(metrics.unknownAppRate)}")
+        Text("Dry-run freeze count: ${metrics.dryRunFreezeCount}")
+        Text("Would-have-frozen actual next app: ${metrics.wouldHaveFrozenActualNextAppCount}")
+        Text("Cycle log: ${state.shadowCycleLogFileName}")
+        Text("Evaluation log: ${state.shadowEvaluationLogFileName}")
+
+        if (metrics.recentUnsafeEvaluations.isNotEmpty()) {
+            Text(
+                text = "Unsafe decisions",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.error
+            )
+            metrics.recentUnsafeEvaluations.forEachIndexed { index, evaluation ->
+                ShadowEvaluationRow(evaluation)
+                if (index != metrics.recentUnsafeEvaluations.lastIndex) HorizontalDivider()
+            }
+        }
+
+        Text(
+            text = "Recent Evaluations (${state.shadowEvaluations.size})",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        if (state.shadowEvaluations.isEmpty()) {
+            Text("No evaluated shadow cycles yet. Leave ForeSight running, then open another app.")
+        } else {
+            state.shadowEvaluations.take(10).forEachIndexed { index, evaluation ->
+                ShadowEvaluationRow(evaluation)
+                if (index != state.shadowEvaluations.take(10).lastIndex) HorizontalDivider()
+            }
+        }
+
+        Button(onClick = onExportShadowLogs) {
+            Text("Export Logs")
+        }
+    }
+}
+
+@Composable
+private fun ShadowEvaluationRow(evaluation: ShadowEvaluation) {
+    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        Text(
+            text = if (evaluation.unsafeWouldFreezeActualNextApp) {
+                "Unsafe: ${evaluation.actualNextApp.appLabel}"
+            } else {
+                "Opened: ${evaluation.actualNextApp.appLabel}"
+            },
+            fontWeight = FontWeight.Medium,
+            color = if (evaluation.unsafeWouldFreezeActualNextApp) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            }
+        )
+        Text(
+            text = evaluation.actualNextApp.packageName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Predicted ${formatTimestamp(evaluation.predictionTimestampMillis)} · " +
+                "opened ${formatTimestamp(evaluation.actualNextApp.timestampMillis)} · " +
+                "latency ${evaluation.predictionToOpenLatencyMs}ms",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Hits: top1=${evaluation.top1Hit}, top3=${evaluation.top3Hit}, top5=${evaluation.top5Hit}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Inference ${evaluation.inferenceLatencyMs}ms · " +
+                "unknown recent ${evaluation.unknownRecentAppCount}/${evaluation.recentAppCount} · " +
+                "would-freeze ${evaluation.dryRunFreezeCount}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
