@@ -72,7 +72,8 @@ data class DecisionPlan(
 )
 
 enum class ActionMode(val displayName: String) {
-    DRY_RUN("DRY_RUN")
+    DRY_RUN("DRY_RUN"),
+    ROOT_ACTIVE("ROOT_ACTIVE")
 }
 
 data class DryRunActionLog(
@@ -129,14 +130,35 @@ data class ShadowMetrics(
     val recentUnsafeEvaluations: List<ShadowEvaluation> = emptyList()
 )
 
+enum class RootAvailability(val displayName: String) {
+    Unknown("Root not checked"),
+    Unavailable("Root unavailable"),
+    Available("Root available"),
+    Denied("Root denied")
+}
+
+data class RootCommandResult(
+    val timestampMillis: Long,
+    val commandId: String,
+    val commandLabel: String,
+    val command: String,
+    val stdout: String,
+    val stderr: String,
+    val exitCode: Int,
+    val timedOut: Boolean
+)
+
 data class DecisionPolicy(
     val freezeThreshold: Float = DEFAULT_FREEZE_THRESHOLD,
     val protectThreshold: Float = DEFAULT_PROTECT_THRESHOLD,
     val recentAppProtectionWindow: Int = DEFAULT_RECENT_APP_PROTECTION_WINDOW,
     val maxAppsToFreezePerCycle: Int = DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE,
     val dryRunEnabled: Boolean = DEFAULT_DRY_RUN_ENABLED,
+    val activeRootModeEnabled: Boolean = DEFAULT_ACTIVE_ROOT_MODE_ENABLED,
     val predictionIntervalSeconds: Int = DEFAULT_PREDICTION_INTERVAL_SECONDS,
-    val pauseWhenBatteryLow: Boolean = DEFAULT_PAUSE_WHEN_BATTERY_LOW
+    val pauseWhenBatteryLow: Boolean = DEFAULT_PAUSE_WHEN_BATTERY_LOW,
+    val rootActionCooldownSeconds: Int = DEFAULT_ROOT_ACTION_COOLDOWN_SECONDS,
+    val rollbackWindowSeconds: Int = DEFAULT_ROLLBACK_WINDOW_SECONDS
 ) {
     fun sanitized(): DecisionPolicy {
         return copy(
@@ -144,7 +166,9 @@ data class DecisionPolicy(
             protectThreshold = protectThreshold.coerceIn(0f, 1f),
             recentAppProtectionWindow = recentAppProtectionWindow.coerceIn(0, 50),
             maxAppsToFreezePerCycle = maxAppsToFreezePerCycle.coerceIn(0, 25),
-            predictionIntervalSeconds = predictionIntervalSeconds.coerceIn(30, 3600)
+            predictionIntervalSeconds = predictionIntervalSeconds.coerceIn(30, 3600),
+            rootActionCooldownSeconds = rootActionCooldownSeconds.coerceIn(30, 3600),
+            rollbackWindowSeconds = rollbackWindowSeconds.coerceIn(30, 3600)
         )
     }
 
@@ -154,11 +178,19 @@ data class DecisionPolicy(
         const val DEFAULT_RECENT_APP_PROTECTION_WINDOW = 10
         const val DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE = 3
         const val DEFAULT_DRY_RUN_ENABLED = true
+        const val DEFAULT_ACTIVE_ROOT_MODE_ENABLED = false
         const val DEFAULT_PREDICTION_INTERVAL_SECONDS = 60
         const val DEFAULT_PAUSE_WHEN_BATTERY_LOW = true
+        const val DEFAULT_ROOT_ACTION_COOLDOWN_SECONDS = 300
+        const val DEFAULT_ROLLBACK_WINDOW_SECONDS = 300
         const val PROTECTED_TOP_PREDICTIONS = 5
     }
 }
+
+data class RootFrozenRecord(
+    val packageName: String,
+    val frozenAtMillis: Long
+)
 
 enum class MappingSource(val displayName: String) {
     ManualOverride("manual override"),
@@ -181,6 +213,7 @@ data class InstalledAppInfo(
     val appLabel: String,
     val isSystemApp: Boolean,
     val isLaunchable: Boolean,
+    val isEnabled: Boolean,
     val mappedModelAppId: Int?,
     val mappedModelLabel: String?,
     val mappingSource: MappingSource,
@@ -188,6 +221,7 @@ data class InstalledAppInfo(
 )
 
 data class PredictionUiState(
+    val ownPackageName: String = "",
     val usageAccessEnabled: Boolean = false,
     val isLoading: Boolean = false,
     val isInventoryLoading: Boolean = false,
@@ -195,10 +229,15 @@ data class PredictionUiState(
     val showAllInstalledApps: Boolean = false,
     val protectedAllowlist: Set<String> = emptySet(),
     val dryRunFrozenPackages: Set<String> = emptySet(),
+    val rootFrozenPackages: Set<String> = emptySet(),
     val decisionPolicy: DecisionPolicy = DecisionPolicy(),
     val dryRunActionHistory: List<DryRunActionLog> = emptyList(),
     val shadowMetrics: ShadowMetrics = ShadowMetrics(),
     val shadowEvaluations: List<ShadowEvaluation> = emptyList(),
+    val rootAvailability: RootAvailability = RootAvailability.Unknown,
+    val isRootCommandRunning: Boolean = false,
+    val activeRootConfirmationVisible: Boolean = false,
+    val lastRootCommandResult: RootCommandResult? = null,
     val recentApps: List<AppLaunch> = emptyList(),
     val installedApps: List<InstalledAppInfo> = emptyList(),
     val inputAppIds: List<Long> = emptyList(),
@@ -213,5 +252,6 @@ data class PredictionUiState(
     val actionLogFileName: String = PredictionLogger.ACTION_FILE_NAME,
     val shadowCycleLogFileName: String = ShadowEvaluationStore.CYCLE_FILE_NAME,
     val shadowEvaluationLogFileName: String = ShadowEvaluationStore.EVALUATION_FILE_NAME,
+    val rootCommandLogFileName: String = RootCommandRunner.LOG_FILE_NAME,
     val errorLogFileName: String = PredictionLogger.ERROR_FILE_NAME
 )

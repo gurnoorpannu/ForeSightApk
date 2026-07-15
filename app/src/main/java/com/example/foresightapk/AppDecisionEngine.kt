@@ -118,12 +118,12 @@ object AppDecisionEngine {
         val modelLabel = app.mappedModelLabel
         val modelAppId = app.mappedModelAppId
 
-        if (!policy.dryRunEnabled) {
+        if (!policy.dryRunEnabled && !policy.activeRootModeEnabled) {
             return app.decision(
                 action = DecisionAction.IGNORE,
                 confidence = confidence,
                 reason = DecisionReason.DryRunDisabled,
-                detail = "Dry-run decisions are disabled in policy settings."
+                detail = "Dry-run and active root decisions are disabled in policy settings."
             )
         }
 

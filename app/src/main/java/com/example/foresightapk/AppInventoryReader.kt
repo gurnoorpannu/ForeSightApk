@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 
 class AppInventoryReader(
     private val context: Context,
@@ -17,7 +18,7 @@ class AppInventoryReader(
         val launchablePackages = readLaunchablePackages(packageManager)
 
         val appSources = if (includeNonLaunchable) {
-            packageManager.getInstalledApplications(0).map { applicationInfo ->
+            packageManager.getInstalledApplicationsCompat().map { applicationInfo ->
                 AppInventorySource(
                     packageName = applicationInfo.packageName,
                     appLabel = applicationInfo.loadLabel(packageManager)?.toString()
@@ -98,6 +99,7 @@ class AppInventoryReader(
             appLabel = appLabel,
             isSystemApp = applicationInfo.isSystemApp(),
             isLaunchable = isLaunchable,
+            isEnabled = context.packageManager.isPackageEnabled(packageName, applicationInfo),
             mappedModelAppId = mapping.modelAppId,
             mappedModelLabel = mapping.modelLabel,
             mappingSource = mapping.source,
@@ -108,6 +110,29 @@ class AppInventoryReader(
     private fun ApplicationInfo.isSystemApp(): Boolean {
         val systemFlags = ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
         return flags and systemFlags != 0
+    }
+
+    private fun PackageManager.getInstalledApplicationsCompat(): List<ApplicationInfo> {
+        val flags = PackageManager.MATCH_DISABLED_COMPONENTS
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getInstalledApplications(PackageManager.ApplicationInfoFlags.of(flags.toLong()))
+        } else {
+            @Suppress("DEPRECATION")
+            getInstalledApplications(flags)
+        }
+    }
+
+    private fun PackageManager.isPackageEnabled(
+        packageName: String,
+        applicationInfo: ApplicationInfo
+    ): Boolean {
+        return when (getApplicationEnabledSetting(packageName)) {
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
+            PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED -> false
+            else -> applicationInfo.enabled
+        }
     }
 
     private data class AppInventorySource(

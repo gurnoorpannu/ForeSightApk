@@ -63,6 +63,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 
+private const val ROOT_MANUAL_APP_LIMIT = 80
+
 class MainActivity : ComponentActivity() {
     private lateinit var usageEventReader: UsageEventReader
     private lateinit var predictionLogger: PredictionLogger
@@ -70,6 +72,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var mappingStore: AppMappingStore
     private lateinit var policyStore: AppPolicyStore
     private lateinit var shadowStore: ShadowEvaluationStore
+    private lateinit var rootCommandRunner: RootCommandRunner
+    private lateinit var rootFreezeController: RootFreezeController
+    private lateinit var rootDecisionExecutor: RootDecisionExecutor
     private var uiState by mutableStateOf(PredictionUiState())
     private var overridePackageText by mutableStateOf("")
     private var overrideVocabLabelText by mutableStateOf("")
@@ -82,6 +87,9 @@ class MainActivity : ComponentActivity() {
         mappingStore = AppMappingStore(this)
         policyStore = AppPolicyStore(this)
         shadowStore = ShadowEvaluationStore(this, usageEventReader)
+        rootCommandRunner = RootCommandRunner(this)
+        rootFreezeController = RootFreezeController(this, rootCommandRunner, policyStore)
+        rootDecisionExecutor = RootDecisionExecutor(policyStore, rootFreezeController)
         appInventoryReader = AppInventoryReader(this, mappingStore)
         refreshPolicyState()
 
@@ -103,9 +111,19 @@ class MainActivity : ComponentActivity() {
                     onAddProtectedPackage = ::addProtectedPackage,
                     onRemoveProtectedPackage = ::removeProtectedPackage,
                     onPolicyChange = ::updateDecisionPolicy,
+                    onRequestActiveRootMode = ::requestActiveRootMode,
+                    onConfirmActiveRootMode = ::confirmActiveRootMode,
+                    onDisableActiveRootMode = ::disableActiveRootMode,
+                    onDismissActiveRootConfirmation = ::dismissActiveRootConfirmation,
                     onResetPolicyDefaults = ::resetDecisionPolicyDefaults,
                     onClearDryRunLogs = ::clearDryRunLogs,
                     onExportShadowLogs = ::exportShadowLogs,
+                    onCheckRoot = ::checkRoot,
+                    onRunRootId = ::runRootId,
+                    onRunRootPackageList = ::runRootPackageList,
+                    onFreezePackage = ::freezeRootPackage,
+                    onUnfreezePackage = ::unfreezeRootPackage,
+                    onUnfreezeAllForeSightFrozen = ::unfreezeAllForeSightFrozen,
                     onStartBackgroundService = ::startBackgroundService,
                     onStopBackgroundService = ::stopBackgroundService,
                     onSelectMappingPackage = { packageName, vocabLabel ->
@@ -179,9 +197,11 @@ class MainActivity : ComponentActivity() {
         if (!::policyStore.isInitialized) return
         val (shadowMetrics, shadowEvaluations) = readShadowDashboard()
         uiState = uiState.copy(
+            ownPackageName = packageName,
             isBackgroundServiceRunning = ForeSightBackgroundService.isRunning,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
             dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
+            rootFrozenPackages = policyStore.getRootFrozenPackages(),
             decisionPolicy = policyStore.getDecisionPolicy(),
             dryRunActionHistory = policyStore.getRecentActionLogs(),
             shadowMetrics = shadowMetrics,
@@ -397,6 +417,50 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun requestActiveRootMode() {
+        uiState = uiState.copy(
+            activeRootConfirmationVisible = true,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Active Root Mode confirmation requested."
+        )
+    }
+
+    private fun confirmActiveRootMode() {
+        if (uiState.rootAvailability != RootAvailability.Available) {
+            uiState = uiState.copy(
+                errorMessage = "Check root successfully before enabling Active Root Mode.",
+                diagnostics = uiState.diagnostics + "Active Root Mode blocked until root is available."
+            )
+            return
+        }
+        val updated = policyStore.getDecisionPolicy().copy(
+            activeRootModeEnabled = true,
+            dryRunEnabled = true
+        )
+        policyStore.saveDecisionPolicy(updated)
+        uiState = uiState.copy(
+            decisionPolicy = policyStore.getDecisionPolicy(),
+            activeRootConfirmationVisible = false,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Active Root Mode enabled."
+        )
+    }
+
+    private fun disableActiveRootMode() {
+        val updated = policyStore.getDecisionPolicy().copy(activeRootModeEnabled = false)
+        policyStore.saveDecisionPolicy(updated)
+        uiState = uiState.copy(
+            decisionPolicy = policyStore.getDecisionPolicy(),
+            activeRootConfirmationVisible = false,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Active Root Mode disabled."
+        )
+    }
+
+    private fun dismissActiveRootConfirmation() {
+        uiState = uiState.copy(activeRootConfirmationVisible = false)
+    }
+
     private fun resetDecisionPolicyDefaults() {
         policyStore.resetDecisionPolicyDefaults()
         updateDecisionPolicy(policyStore.getDecisionPolicy())
@@ -439,6 +503,200 @@ class MainActivity : ComponentActivity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         startActivity(Intent.createChooser(exportIntent, "Export ForeSight shadow logs"))
+    }
+
+    private fun checkRoot() {
+        if (!::rootCommandRunner.isInitialized || uiState.isRootCommandRunning) return
+        uiState = uiState.copy(
+            isRootCommandRunning = true,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Checking root with safe id probe."
+        )
+        lifecycleScope.launch {
+            val result = runCatching {
+                rootCommandRunner.checkRootAvailability()
+            }
+            uiState = result.fold(
+                onSuccess = { (availability, commandResult) ->
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = availability,
+                        lastRootCommandResult = commandResult,
+                        diagnostics = uiState.diagnostics + "Root status: ${availability.displayName}."
+                    )
+                },
+                onFailure = { error ->
+                    if (error is CancellationException) throw error
+                    ForeSightLog.error("Root capability check failed", error)
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = RootAvailability.Denied,
+                        errorMessage = "Root capability check failed: ${error.message ?: error::class.java.simpleName}",
+                        diagnostics = uiState.diagnostics + "Root capability check failed."
+                    )
+                }
+            )
+        }
+    }
+
+    private fun runRootId() {
+        runSafeRootCommand(RootCommandRunner.SafeRootCommand.Id)
+    }
+
+    private fun runRootPackageList() {
+        runSafeRootCommand(RootCommandRunner.SafeRootCommand.PackageList)
+    }
+
+    private fun freezeRootPackage(packageName: String) {
+        runRootMutation(
+            label = "Freeze package",
+            packageName = packageName
+        ) {
+            rootFreezeController.freezePackage(packageName)
+        }
+    }
+
+    private fun unfreezeRootPackage(packageName: String) {
+        runRootMutation(
+            label = "Unfreeze package",
+            packageName = packageName
+        ) {
+            rootFreezeController.unfreezePackage(packageName)
+        }
+    }
+
+    private fun unfreezeAllForeSightFrozen() {
+        if (!::rootFreezeController.isInitialized || uiState.isRootCommandRunning) return
+        val frozenCount = policyStore.getRootFrozenPackages().size
+        if (frozenCount == 0) {
+            uiState = uiState.copy(
+                errorMessage = null,
+                diagnostics = uiState.diagnostics + "No ForeSight-frozen apps to unfreeze."
+            )
+            return
+        }
+
+        uiState = uiState.copy(
+            isRootCommandRunning = true,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Emergency unfreeze started for $frozenCount ForeSight-frozen apps."
+        )
+        lifecycleScope.launch {
+            val result = runCatching {
+                rootFreezeController.unfreezeAllFrozenByForeSight()
+            }
+            uiState = result.fold(
+                onSuccess = { results ->
+                    val failedCount = results.count { it.exitCode != 0 || it.timedOut }
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = if (failedCount == 0) RootAvailability.Available else uiState.rootAvailability,
+                        lastRootCommandResult = results.lastOrNull() ?: uiState.lastRootCommandResult,
+                        rootFrozenPackages = policyStore.getRootFrozenPackages(),
+                        errorMessage = if (failedCount == 0) {
+                            null
+                        } else {
+                            "Emergency unfreeze completed with $failedCount failures."
+                        },
+                        diagnostics = uiState.diagnostics +
+                            "Emergency unfreeze complete: ${results.size - failedCount}/${results.size} succeeded."
+                    )
+                },
+                onFailure = { error ->
+                    if (error is CancellationException) throw error
+                    ForeSightLog.error("Emergency unfreeze failed", error)
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        errorMessage = "Emergency unfreeze failed: ${error.message ?: error::class.java.simpleName}",
+                        diagnostics = uiState.diagnostics + "Emergency unfreeze failed."
+                    )
+                }
+            )
+            refreshAppInventory(showAllInstalledApps = true)
+        }
+    }
+
+    private fun runSafeRootCommand(command: RootCommandRunner.SafeRootCommand) {
+        if (!::rootCommandRunner.isInitialized || uiState.isRootCommandRunning) return
+        uiState = uiState.copy(
+            isRootCommandRunning = true,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "Running safe root command: ${command.label}."
+        )
+        lifecycleScope.launch {
+            val result = runCatching {
+                rootCommandRunner.runSafeCommand(command)
+            }
+            uiState = result.fold(
+                onSuccess = { commandResult ->
+                    val availability = if (command == RootCommandRunner.SafeRootCommand.Id) {
+                        RootCommandRunner.inferAvailabilityFromIdResult(commandResult)
+                    } else {
+                        uiState.rootAvailability
+                    }
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = availability,
+                        lastRootCommandResult = commandResult,
+                        diagnostics = uiState.diagnostics + "Safe root command finished: ${command.label}."
+                    )
+                },
+                onFailure = { error ->
+                    if (error is CancellationException) throw error
+                    ForeSightLog.error("Safe root command failed", error)
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = RootAvailability.Denied,
+                        errorMessage = "Safe root command failed: ${error.message ?: error::class.java.simpleName}",
+                        diagnostics = uiState.diagnostics + "Safe root command failed: ${command.label}."
+                    )
+                }
+            )
+        }
+    }
+
+    private fun runRootMutation(
+        label: String,
+        packageName: String,
+        command: suspend () -> RootCommandResult
+    ) {
+        if (!::rootFreezeController.isInitialized || uiState.isRootCommandRunning) return
+        uiState = uiState.copy(
+            isRootCommandRunning = true,
+            errorMessage = null,
+            diagnostics = uiState.diagnostics + "$label requested for $packageName."
+        )
+        lifecycleScope.launch {
+            val result = runCatching { command() }
+            uiState = result.fold(
+                onSuccess = { commandResult ->
+                    val succeeded = commandResult.exitCode == 0 && !commandResult.timedOut
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        rootAvailability = if (succeeded) RootAvailability.Available else uiState.rootAvailability,
+                        lastRootCommandResult = commandResult,
+                        rootFrozenPackages = policyStore.getRootFrozenPackages(),
+                        errorMessage = if (succeeded) {
+                            null
+                        } else {
+                            "$label failed for $packageName: ${rootFailureSummary(commandResult)}"
+                        },
+                        diagnostics = uiState.diagnostics +
+                            "$label ${if (succeeded) "succeeded" else "failed"} for $packageName."
+                    )
+                },
+                onFailure = { error ->
+                    if (error is CancellationException) throw error
+                    ForeSightLog.warn("$label blocked for package=$packageName", error)
+                    uiState.copy(
+                        isRootCommandRunning = false,
+                        errorMessage = "$label blocked for $packageName: ${error.message ?: error::class.java.simpleName}",
+                        diagnostics = uiState.diagnostics + "$label blocked for $packageName."
+                    )
+                }
+            )
+            refreshAppInventory(showAllInstalledApps = true)
+        }
     }
 
     private fun startBackgroundService() {
@@ -539,8 +797,16 @@ class MainActivity : ComponentActivity() {
                         installedApps = uiState.installedApps,
                         recentApps = prediction.recentApps
                     )
-                    policyStore.applyDecisionPlan(decisionPlan)
-                    val actionLogs = policyStore.recordActionLogs(decisionPlan)
+                    val policy = policyStore.getDecisionPolicy()
+                    if (policy.activeRootModeEnabled) {
+                        rootDecisionExecutor.rollbackRecentlyOpenedFrozenApps(prediction.recentApps, policy)
+                    } else {
+                        policyStore.applyDecisionPlan(decisionPlan)
+                    }
+                    val actionLogs = policyStore.recordActionLogs(
+                        decisionPlan,
+                        mode = if (policy.activeRootModeEnabled) ActionMode.ROOT_ACTIVE else ActionMode.DRY_RUN
+                    )
                     val updatedFrozenPackages = policyStore.getDryRunFrozenPackages()
                     runCatching {
                         predictionLogger.logDecisionPlan(decisionPlan)
@@ -552,6 +818,9 @@ class MainActivity : ComponentActivity() {
                             throwable = logError,
                             diagnostics = decisionPlan.diagnostics
                         )
+                    }
+                    if (policy.activeRootModeEnabled) {
+                        rootDecisionExecutor.executeActivePlan(decisionPlan, policy)
                     }
                     recordShadowCycle(prediction, decisionPlan)
                     val (shadowMetrics, shadowEvaluations) = readShadowDashboard()
@@ -566,6 +835,7 @@ class MainActivity : ComponentActivity() {
                         dryRunFrozenPackages = updatedFrozenPackages,
                         decisionPolicy = policyStore.getDecisionPolicy(),
                         dryRunActionHistory = policyStore.getRecentActionLogs(),
+                        rootFrozenPackages = policyStore.getRootFrozenPackages(),
                         shadowMetrics = shadowMetrics,
                         shadowEvaluations = shadowEvaluations,
                         latencyMs = prediction.latencyMs,
@@ -679,14 +949,19 @@ class MainActivity : ComponentActivity() {
         installedApps: List<InstalledAppInfo>,
         recentApps: List<AppLaunch>
     ): DecisionPlan {
+        val policy = policyStore.getDecisionPolicy()
         return AppDecisionEngine.buildPlan(
             predictions = predictions,
             installedApps = installedApps,
             recentApps = recentApps,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
-            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
+            dryRunFrozenPackages = if (policy.activeRootModeEnabled) {
+                policyStore.getRootFrozenPackages()
+            } else {
+                policyStore.getDryRunFrozenPackages()
+            },
             ownPackageName = packageName,
-            policy = policyStore.getDecisionPolicy()
+            policy = policy
         )
     }
 
@@ -739,9 +1014,19 @@ private fun ForeSightScreen(
     onAddProtectedPackage: (String) -> Unit,
     onRemoveProtectedPackage: (String) -> Unit,
     onPolicyChange: (DecisionPolicy) -> Unit,
+    onRequestActiveRootMode: () -> Unit,
+    onConfirmActiveRootMode: () -> Unit,
+    onDisableActiveRootMode: () -> Unit,
+    onDismissActiveRootConfirmation: () -> Unit,
     onResetPolicyDefaults: () -> Unit,
     onClearDryRunLogs: () -> Unit,
     onExportShadowLogs: () -> Unit,
+    onCheckRoot: () -> Unit,
+    onRunRootId: () -> Unit,
+    onRunRootPackageList: () -> Unit,
+    onFreezePackage: (String) -> Unit,
+    onUnfreezePackage: (String) -> Unit,
+    onUnfreezeAllForeSightFrozen: () -> Unit,
     onStartBackgroundService: () -> Unit,
     onStopBackgroundService: () -> Unit,
     onSelectMappingPackage: (String, String?) -> Unit
@@ -892,10 +1177,32 @@ private fun ForeSightScreen(
 
                 4 -> {
                     item {
+                        RootSandboxCard(
+                            state = state,
+                            onCheckRoot = onCheckRoot,
+                            onRunRootId = onRunRootId,
+                            onRunRootPackageList = onRunRootPackageList
+                        )
+                    }
+                    item {
+                        ManualRootFreezeCard(
+                            state = state,
+                            onLoadAllInstalledApps = { onInventoryScopeChange(true) },
+                            onFreezePackage = onFreezePackage,
+                            onUnfreezePackage = onUnfreezePackage,
+                            onUnfreezeAllForeSightFrozen = onUnfreezeAllForeSightFrozen
+                        )
+                    }
+                    item {
                         PolicySettingsCard(
                             serviceRunning = state.isBackgroundServiceRunning,
+                            state = state,
                             policy = state.decisionPolicy,
                             onPolicyChange = onPolicyChange,
+                            onRequestActiveRootMode = onRequestActiveRootMode,
+                            onConfirmActiveRootMode = onConfirmActiveRootMode,
+                            onDisableActiveRootMode = onDisableActiveRootMode,
+                            onDismissActiveRootConfirmation = onDismissActiveRootConfirmation,
                             onResetPolicyDefaults = onResetPolicyDefaults,
                             onClearDryRunLogs = onClearDryRunLogs,
                             onStartBackgroundService = onStartBackgroundService,
@@ -1128,10 +1435,278 @@ private fun ShadowEvaluationRow(evaluation: ShadowEvaluation) {
 }
 
 @Composable
+private fun RootSandboxCard(
+    state: PredictionUiState,
+    onCheckRoot: () -> Unit,
+    onRunRootId: () -> Unit,
+    onRunRootPackageList: () -> Unit
+) {
+    SectionCard(title = "Root Sandbox") {
+        Text(
+            text = state.rootAvailability.displayName,
+            fontWeight = FontWeight.SemiBold,
+            color = when (state.rootAvailability) {
+                RootAvailability.Available -> MaterialTheme.colorScheme.primary
+                RootAvailability.Denied -> MaterialTheme.colorScheme.error
+                else -> MaterialTheme.colorScheme.onSurface
+            }
+        )
+        Text("Command log: ${state.rootCommandLogFileName}")
+        Text(
+            text = "Only fixed allowlisted probes and validated package actions can run. Arbitrary commands are blocked.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onCheckRoot,
+                enabled = !state.isRootCommandRunning
+            ) {
+                Text(if (state.isRootCommandRunning) "Running" else "Check Root")
+            }
+            TextButton(
+                onClick = onRunRootId,
+                enabled = !state.isRootCommandRunning
+            ) {
+                Text("Run id")
+            }
+        }
+        TextButton(
+            onClick = onRunRootPackageList,
+            enabled = !state.isRootCommandRunning
+        ) {
+            Text("Run pm list packages")
+        }
+
+        state.lastRootCommandResult?.let { result ->
+            RootCommandResultView(result)
+        }
+    }
+}
+
+@Composable
+private fun RootCommandResultView(result: RootCommandResult) {
+    Text(
+        text = "Last command: ${result.commandLabel}",
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold
+    )
+    Text("Command: ${result.command}")
+    Text("Exit code: ${result.exitCode}")
+    Text("Timed out: ${result.timedOut}")
+    Text("Time: ${formatTimestamp(result.timestampMillis)}")
+
+    val stdoutPreview = rootOutputPreview(result.stdout, result.commandId)
+    val stderrPreview = rootOutputPreview(result.stderr, result.commandId)
+    if (stdoutPreview.isNotBlank()) {
+        Text(
+            text = "stdout",
+            fontWeight = FontWeight.Medium
+        )
+        Text(
+            text = stdoutPreview,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    if (stderrPreview.isNotBlank()) {
+        Text(
+            text = "stderr",
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.error
+        )
+        Text(
+            text = stderrPreview,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
+}
+
+private fun rootOutputPreview(output: String, commandId: String): String {
+    val lines = output.lineSequence()
+        .filter { it.isNotBlank() }
+        .toList()
+    if (lines.isEmpty()) return ""
+
+    val limit = if (commandId == RootCommandRunner.SafeRootCommand.PackageList.id) 10 else 20
+    val visible = lines.take(limit)
+    return if (lines.size > visible.size) {
+        visible.joinToString(separator = "\n") + "\n... showing ${visible.size} of ${lines.size} lines"
+    } else {
+        visible.joinToString(separator = "\n")
+    }
+}
+
+private fun rootFailureSummary(result: RootCommandResult): String {
+    return result.stderr
+        .takeIf { it.isNotBlank() }
+        ?: result.stdout.takeIf { it.isNotBlank() }
+        ?: "exit=${result.exitCode}, timedOut=${result.timedOut}"
+}
+
+@Composable
+private fun ManualRootFreezeCard(
+    state: PredictionUiState,
+    onLoadAllInstalledApps: () -> Unit,
+    onFreezePackage: (String) -> Unit,
+    onUnfreezePackage: (String) -> Unit,
+    onUnfreezeAllForeSightFrozen: () -> Unit
+) {
+    SectionCard(title = "Manual Root Freeze") {
+        Text("ForeSight frozen apps: ${state.rootFrozenPackages.size}")
+        Text(
+            text = "Manual actions use root immediately. Automation still does not freeze or unfreeze apps.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onLoadAllInstalledApps,
+                enabled = !state.isInventoryLoading
+            ) {
+                Text(if (state.isInventoryLoading) "Loading Apps" else "Load All Apps")
+            }
+            TextButton(
+                onClick = onUnfreezeAllForeSightFrozen,
+                enabled = !state.isRootCommandRunning && state.rootFrozenPackages.isNotEmpty()
+            ) {
+                Text("Unfreeze All")
+            }
+        }
+
+        val apps = state.installedApps
+            .sortedWith(
+                compareByDescending<InstalledAppInfo> { it.packageName in state.rootFrozenPackages }
+                    .thenBy { it.isEnabled }
+                    .thenBy { it.isSystemApp }
+                    .thenBy { it.appLabel.lowercase(Locale.getDefault()) }
+            )
+            .take(ROOT_MANUAL_APP_LIMIT)
+
+        if (state.installedApps.isEmpty()) {
+            Text("Load all apps to choose manual root freeze targets.")
+        } else {
+            apps.forEachIndexed { index, app ->
+                ManualRootAppRow(
+                    app = app,
+                    state = state,
+                    onFreezePackage = onFreezePackage,
+                    onUnfreezePackage = onUnfreezePackage
+                )
+                if (index != apps.lastIndex) HorizontalDivider()
+            }
+            if (state.installedApps.size > apps.size) {
+                Text("Showing ${apps.size} of ${state.installedApps.size} apps.")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ManualRootAppRow(
+    app: InstalledAppInfo,
+    state: PredictionUiState,
+    onFreezePackage: (String) -> Unit,
+    onUnfreezePackage: (String) -> Unit
+) {
+    val freezeBlockedReason = app.manualFreezeBlockedReason(
+        ownPackageName = state.ownPackageName,
+        allowlist = state.protectedAllowlist
+    )
+    val isForeSightFrozen = app.packageName in state.rootFrozenPackages
+    Column(
+        modifier = Modifier.padding(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(app.appLabel, fontWeight = FontWeight.Medium)
+        Text(
+            text = app.packageName,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = app.rootStatusText(isForeSightFrozen),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (isForeSightFrozen) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            }
+        )
+        freezeBlockedReason?.let { reason ->
+            Text(
+                text = "Freeze blocked: $reason",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onFreezePackage(app.packageName) },
+                enabled = !state.isRootCommandRunning && app.isEnabled && freezeBlockedReason == null
+            ) {
+                Text("Freeze")
+            }
+            TextButton(
+                onClick = { onUnfreezePackage(app.packageName) },
+                enabled = !state.isRootCommandRunning && (!app.isEnabled || isForeSightFrozen)
+            ) {
+                Text("Unfreeze")
+            }
+        }
+    }
+}
+
+private fun InstalledAppInfo.rootStatusText(isForeSightFrozen: Boolean): String {
+    return when {
+        isForeSightFrozen -> "Frozen by ForeSight"
+        !isEnabled -> "Disabled outside ForeSight"
+        else -> "Enabled"
+    }
+}
+
+private fun InstalledAppInfo.manualFreezeBlockedReason(
+    ownPackageName: String,
+    allowlist: Set<String>
+): String? {
+    val packageNameLower = packageName.lowercase(Locale.getDefault())
+    val labelLower = appLabel.lowercase(Locale.getDefault())
+    return when {
+        packageName == ownPackageName -> "ForeSight itself"
+        packageName in allowlist -> "manual allowlist"
+        packageNameLower.contains("launcher") || labelLower.contains("launcher") -> "launcher"
+        packageNameLower.contains("inputmethod") ||
+            labelLower.contains("keyboard") ||
+            labelLower.contains("gboard") -> "keyboard/input method"
+        packageNameLower.contains("systemui") || labelLower == "system ui" -> "system UI"
+        packageNameLower.contains("dialer") || packageNameLower.contains(".phone") || labelLower == "phone" -> {
+            "phone/dialer"
+        }
+        packageNameLower.contains("settings") || labelLower == "settings" -> "settings"
+        packageNameLower.contains("clock") || packageNameLower.contains("alarm") || labelLower == "clock" -> {
+            "clock/alarm"
+        }
+        packageNameLower.contains("accessibility") ||
+            packageNameLower.contains("talkback") ||
+            labelLower.contains("accessibility") ||
+            labelLower.contains("voice access") ||
+            labelLower.contains("switch access") -> "accessibility"
+        isSystemApp -> "system app"
+        else -> null
+    }
+}
+
+@Composable
 private fun PolicySettingsCard(
     serviceRunning: Boolean,
+    state: PredictionUiState,
     policy: DecisionPolicy,
     onPolicyChange: (DecisionPolicy) -> Unit,
+    onRequestActiveRootMode: () -> Unit,
+    onConfirmActiveRootMode: () -> Unit,
+    onDisableActiveRootMode: () -> Unit,
+    onDismissActiveRootConfirmation: () -> Unit,
     onResetPolicyDefaults: () -> Unit,
     onClearDryRunLogs: () -> Unit,
     onStartBackgroundService: () -> Unit,
@@ -1164,7 +1739,7 @@ private fun PolicySettingsCard(
             Column(modifier = Modifier.weight(1f)) {
                 Text("Dry-run enabled", fontWeight = FontWeight.Medium)
                 Text(
-                    text = "No root commands are ever executed in this phase.",
+                    text = "Dry Run remains the default. Active Root Mode requires separate confirmation.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1175,6 +1750,63 @@ private fun PolicySettingsCard(
                     onPolicyChange(policy.copy(dryRunEnabled = enabled))
                 }
             )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Active Root Mode", fontWeight = FontWeight.Medium)
+                Text(
+                    text = if (policy.activeRootModeEnabled) {
+                        "Automatic root freeze/unfreeze is enabled."
+                    } else {
+                        "Automatic root freeze/unfreeze is disabled."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (policy.activeRootModeEnabled) {
+                TextButton(onClick = onDisableActiveRootMode) {
+                    Text("Disable")
+                }
+            } else {
+                Button(onClick = onRequestActiveRootMode) {
+                    Text("Enable")
+                }
+            }
+        }
+        if (state.activeRootConfirmationVisible) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Enable Active Root Mode?",
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Text(
+                        text = "ForeSight will automatically run root freeze and unfreeze commands from prediction cycles.",
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = onConfirmActiveRootMode) {
+                            Text("Confirm")
+                        }
+                        TextButton(onClick = onDismissActiveRootConfirmation) {
+                            Text("Cancel")
+                        }
+                    }
+                }
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1228,10 +1860,27 @@ private fun PolicySettingsCard(
             step = 30,
             onValueChange = { value -> onPolicyChange(policy.copy(predictionIntervalSeconds = value)) }
         )
+        PolicyIntStepper(
+            title = "Root action cooldown seconds",
+            value = policy.rootActionCooldownSeconds,
+            min = 30,
+            max = 3600,
+            step = 30,
+            onValueChange = { value -> onPolicyChange(policy.copy(rootActionCooldownSeconds = value)) }
+        )
+        PolicyIntStepper(
+            title = "Rollback window seconds",
+            value = policy.rollbackWindowSeconds,
+            min = 30,
+            max = 3600,
+            step = 30,
+            onValueChange = { value -> onPolicyChange(policy.copy(rollbackWindowSeconds = value)) }
+        )
 
         Text("Default max would-freeze apps: ${DecisionPolicy.DEFAULT_MAX_APPS_TO_FREEZE_PER_CYCLE}")
         Text("Default protected recent apps: ${DecisionPolicy.DEFAULT_RECENT_APP_PROTECTION_WINDOW}")
         Text("Default prediction interval: ${DecisionPolicy.DEFAULT_PREDICTION_INTERVAL_SECONDS}s")
+        Text("Default root cooldown: ${DecisionPolicy.DEFAULT_ROOT_ACTION_COOLDOWN_SECONDS}s")
         Text("Protected top predictions: ${DecisionPolicy.PROTECTED_TOP_PREDICTIONS}")
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1539,6 +2188,18 @@ private fun StatusCard(
                     "Background loop: running"
                 } else {
                     "Background loop: stopped"
+                }
+            )
+            Text(
+                text = if (state.decisionPolicy.activeRootModeEnabled) {
+                    "Execution mode: Active Root"
+                } else {
+                    "Execution mode: Dry Run"
+                },
+                color = if (state.decisionPolicy.activeRootModeEnabled) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurface
                 }
             )
             Text("Prediction interval: ${state.decisionPolicy.predictionIntervalSeconds}s")

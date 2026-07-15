@@ -43,6 +43,7 @@ class ForeSightBackgroundService : Service() {
     private lateinit var appInventoryReader: AppInventoryReader
     private lateinit var policyStore: AppPolicyStore
     private lateinit var shadowStore: ShadowEvaluationStore
+    private lateinit var rootDecisionExecutor: RootDecisionExecutor
     private var loopJob: Job? = null
     private var lastPredictionText: String = "not run yet"
 
@@ -55,6 +56,9 @@ class ForeSightBackgroundService : Service() {
         shadowStore = ShadowEvaluationStore(this, usageEventReader)
         val mappingStore = AppMappingStore(this)
         policyStore = AppPolicyStore(this)
+        val rootCommandRunner = RootCommandRunner(this)
+        val rootFreezeController = RootFreezeController(this, rootCommandRunner, policyStore)
+        rootDecisionExecutor = RootDecisionExecutor(policyStore, rootFreezeController)
         appInventoryReader = AppInventoryReader(this, mappingStore)
         createNotificationChannel()
     }
@@ -128,23 +132,39 @@ class ForeSightBackgroundService : Service() {
         val prediction = runIsolatedInference(recentApps)
         predictionLogger.log(prediction)
 
-        val installedApps = withContext(Dispatchers.Default) {
-            appInventoryReader.readInstalledApps(includeNonLaunchable = false)
-        }
         val policy = policyStore.getDecisionPolicy()
+        if (policy.activeRootModeEnabled) {
+            rootDecisionExecutor.rollbackRecentlyOpenedFrozenApps(prediction.recentApps, policy)
+        }
+
+        val installedApps = withContext(Dispatchers.Default) {
+            appInventoryReader.readInstalledApps(includeNonLaunchable = policy.activeRootModeEnabled)
+        }
         val decisionPlan = AppDecisionEngine.buildPlan(
             predictions = prediction.predictions,
             installedApps = installedApps,
             recentApps = prediction.recentApps,
             protectedAllowlist = policyStore.getProtectedAllowlist(),
-            dryRunFrozenPackages = policyStore.getDryRunFrozenPackages(),
+            dryRunFrozenPackages = if (policy.activeRootModeEnabled) {
+                policyStore.getRootFrozenPackages()
+            } else {
+                policyStore.getDryRunFrozenPackages()
+            },
             ownPackageName = packageName,
             policy = policy
         )
-        policyStore.applyDecisionPlan(decisionPlan)
-        val actionLogs = policyStore.recordActionLogs(decisionPlan)
+        if (!policy.activeRootModeEnabled) {
+            policyStore.applyDecisionPlan(decisionPlan)
+        }
+        val actionLogs = policyStore.recordActionLogs(
+            decisionPlan,
+            mode = if (policy.activeRootModeEnabled) ActionMode.ROOT_ACTIVE else ActionMode.DRY_RUN
+        )
         predictionLogger.logDecisionPlan(decisionPlan)
         predictionLogger.logDryRunActions(actionLogs)
+        if (policy.activeRootModeEnabled) {
+            rootDecisionExecutor.executeActivePlan(decisionPlan, policy)
+        }
         runCatching {
             shadowStore.evaluatePendingCycles()
             shadowStore.recordCycle(prediction, decisionPlan)
@@ -298,7 +318,10 @@ class ForeSightBackgroundService : Service() {
         return builder
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
             .setContentTitle("ForeSight running")
-            .setContentText("Last prediction: $lastPredictionText · Mode: Dry Run")
+            .setContentText(
+                "Last prediction: $lastPredictionText · Mode: " +
+                    if (policyStore.getDecisionPolicy().activeRootModeEnabled) "Active Root" else "Dry Run"
+            )
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setShowWhen(false)
